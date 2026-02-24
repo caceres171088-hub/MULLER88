@@ -135,9 +135,20 @@ class AutoRunRequest(BaseModel):
     steal_top: int = Field(3, ge=0, le=10, description="Máximo de jugadores a robar por cláusula")
     steal_min_efficiency: float = Field(
         2.0, ge=0.0,
-        description="Eficiencia mínima (pts/millón) para considerar pagar la cláusula de un rival",
+        description="Eficiencia mínima (avg_pts/jornada por millón) para considerar pagar la cláusula de un rival",
     )
     max_teams_scan: int = Field(8, ge=1, le=20, description="Equipos rivales a escanear en busca de objetivos")
+    sell_min_avg: float = Field(
+        0.0, ge=0.0,
+        description=(
+            "Protege jugadores: no vender si su avg_per_game >= este valor. "
+            "0 = sin protección. Ejemplo: 7.0 = no vender si hace ≥7 pts/jornada"
+        ),
+    )
+    target_jornada: float = Field(
+        150.0, ge=1.0,
+        description="Objetivo de puntos totales del XI por jornada. Muestra el gap en la respuesta.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -390,15 +401,25 @@ def _clause_price(player: dict) -> float:
     return 0.0
 
 
+def _avg_per_game(player: dict) -> float:
+    """Puntos medios por jornada (campo average.average si existe, si no calcula)."""
+    avg = (player.get("average") or {}).get("average")
+    if avg is not None:
+        return round(float(avg), 4)
+    pts = float(_get_field(player, "points", "score", "avgScore", "totalPoints") or 0)
+    matches = int((player.get("average") or {}).get("matches") or 0)
+    return round(pts / matches, 4) if matches else 0.0
+
+
 def _efficiency(player: dict, cost_key: str) -> float:
-    """Puntos por millón de coste. Cuanto mayor, mejor valor."""
-    score = float(_get_field(player, "points", "score", "avg_score", "avgScore", "totalPoints") or 0)
+    """Puntos medios por jornada por millón de coste. Cuanto mayor, mejor valor."""
+    score = _avg_per_game(player)
     if cost_key == "clause":
         cost = _clause_price(player)
     else:
         raw = _get_field(player, cost_key, "value", "marketValue") or 0
         cost = float(raw) if not isinstance(raw, dict) else 0.0
-    if not cost or cost == 0:
+    if not score or not cost:
         return 0.0
     return round(score / (cost / 1_000_000), 4)
 
@@ -534,57 +555,114 @@ def _normalize_pos(player: dict) -> str:
     return _POS_MAP.get(str(raw).lower(), str(raw).upper() or "UNK")
 
 
-def _score_val(player: dict) -> float:
-    return float(_get_field(player, "points", "score", "avg_score", "avgScore", "totalPoints") or 0)
+def _primary_pos(player: dict) -> str:
+    raw = str(_get_field(player, "role", "position", "pos") or "").lower()
+    return _POS_MAP.get(raw, "")
 
 
-def _best_lineup_analysis(players: list[dict]) -> dict:
-    """Prueba todas las formaciones y devuelve el XI con mayor total de puntos."""
-    by_pos: dict[str, list[dict]] = {"GK": [], "DEF": [], "MID": [], "FWD": []}
-    for p in players:
-        pos = _normalize_pos(p)
-        if pos in by_pos:
-            by_pos[pos].append(p)
-    for pos in by_pos:
-        by_pos[pos].sort(key=_score_val, reverse=True)
+def _secondary_pos(player: dict) -> str:
+    raw = str(player.get("role2") or "").strip().lower()
+    return _POS_MAP.get(raw, "") if raw else ""
 
+
+def _best_lineup_analysis(players: list[dict], target_apg: float = 150.0) -> dict:
+    """
+    Prueba todas las formaciones usando rol principal y secundario (role2).
+    Rankea por avg_per_game y devuelve progreso hacia el objetivo de puntos/jornada.
+    """
     best: dict | None = None
     best_total = -1.0
 
     for f in _FORMATIONS:
-        slots = {"GK": 1, "DEF": f["DEF"], "MID": f["MID"], "FWD": f["FWD"]}
-        # Verificar que hay suficientes jugadores en cada posición
-        if any(len(by_pos[pos]) < slots[pos] for pos in slots):
+        needed = {"GK": 1, "DEF": f["DEF"], "MID": f["MID"], "FWD": f["FWD"]}
+
+        # Paso 1: llenar con rol principal
+        used: set[str] = set()
+        assignment: dict[str, list[dict]] = {pos: [] for pos in needed}
+
+        primary_pools = {
+            pos: sorted(
+                [p for p in players if _primary_pos(p) == pos],
+                key=_avg_per_game, reverse=True,
+            )
+            for pos in needed
+        }
+        for pos, n in needed.items():
+            for p in primary_pools[pos]:
+                if len(assignment[pos]) >= n:
+                    break
+                assignment[pos].append(p)
+                used.add(_get_field(p, "_id", "id"))
+
+        # Paso 2: rellenar huecos con role2
+        for pos, n in needed.items():
+            if len(assignment[pos]) >= n:
+                continue
+            r2_pool = sorted(
+                [p for p in players
+                 if _get_field(p, "_id", "id") not in used and _secondary_pos(p) == pos],
+                key=_avg_per_game, reverse=True,
+            )
+            for p in r2_pool:
+                if len(assignment[pos]) >= n:
+                    break
+                assignment[pos].append(p)
+                used.add(_get_field(p, "_id", "id"))
+
+        # Comprobar formación completa
+        if any(len(assignment[pos]) < needed[pos] for pos in needed):
             continue
-        selected = []
-        for pos, n in slots.items():
-            selected.extend(by_pos[pos][:n])
-        total = sum(_score_val(p) for p in selected)
-        if total > best_total:
-            best_total = total
+
+        total_apg = sum(
+            _avg_per_game(p)
+            for pl in assignment.values()
+            for p in pl
+        )
+        if total_apg > best_total:
+            best_total = total_apg
+            starters = []
+            for pos, pl in assignment.items():
+                for p in pl:
+                    summary = _player_summary(p, "lineup")
+                    summary["assigned_pos"] = pos
+                    summary["avg_per_game"] = _avg_per_game(p)
+                    # Marcar si juega fuera de su rol principal
+                    if _primary_pos(p) != pos:
+                        summary["playing_as_role2"] = True
+                    starters.append(summary)
             best = {
                 "formation": f["name"],
-                "total_score": round(total, 2),
-                "starters": [_player_summary(p, "lineup") for p in selected],
+                "projected_pts_jornada": round(total_apg, 2),
+                "target_pts_jornada": target_apg,
+                "gap_to_target": round(target_apg - total_apg, 2),
+                "starters": starters,
             }
 
     if best is None:
-        # Fallback: devolver los 11 mejores sin filtrar por formación
-        top11 = sorted(players, key=_score_val, reverse=True)[:11]
+        # Fallback: los 11 mejores por avg_per_game sin filtrar formación
+        top11 = sorted(players, key=_avg_per_game, reverse=True)[:11]
+        total_apg = sum(_avg_per_game(p) for p in top11)
         best = {
             "formation": "libre",
-            "total_score": round(sum(_score_val(p) for p in top11), 2),
-            "starters": [_player_summary(p, "lineup") for p in top11],
+            "projected_pts_jornada": round(total_apg, 2),
+            "target_pts_jornada": target_apg,
+            "gap_to_target": round(target_apg - total_apg, 2),
+            "starters": [
+                {**_player_summary(p, "lineup"), "avg_per_game": _avg_per_game(p)}
+                for p in top11
+            ],
         }
 
-    # Suplentes = resto de jugadores no en el XI, ordenados por puntos
+    # Suplentes
     starter_ids = {s["id"] for s in best["starters"]}
     bench = sorted(
         [p for p in players if _get_field(p, "_id", "id") not in starter_ids],
-        key=_score_val,
-        reverse=True,
+        key=_avg_per_game, reverse=True,
     )
-    best["bench"] = [_player_summary(p, "lineup") for p in bench]
+    best["bench"] = [
+        {**_player_summary(p, "lineup"), "avg_per_game": _avg_per_game(p)}
+        for p in bench
+    ]
     return best
 
 
@@ -651,25 +729,30 @@ async def speculate(
 
 
 @app.get("/strategy/lineup", tags=["Estrategia"])
-async def best_lineup(client: FutmondoClient = Depends(get_client)):
+async def best_lineup(
+    target: float = Query(150.0, ge=1.0, description="Objetivo de puntos del XI por jornada"),
+    client: FutmondoClient = Depends(get_client),
+):
     """
     **XI óptimo para máximos puntos por jornada.**
 
     Analiza tu plantilla completa y prueba todas las formaciones posibles
     (4-3-3, 4-4-2, 4-5-1, 3-5-2, 3-4-3, 5-3-2, 5-4-1).
+    Usa `role2` para rellenar huecos en formaciones si hay pocos efectivos en alguna posición.
 
     Devuelve:
-    - `formation`: la formación con mayor total de puntos
-    - `total_score`: suma de puntos de los 11 titulares
-    - `starters`: los 11 titulares con su posición y puntos
-    - `bench`: el resto de tu plantilla ordenado por rendimiento
+    - `formation`: la formación con mayor avg_per_game total
+    - `projected_pts_jornada`: puntos proyectados por jornada del XI
+    - `gap_to_target`: puntos que faltan para llegar al objetivo
+    - `starters`: los 11 titulares con avg_per_game y posición asignada
+    - `bench`: el resto de la plantilla ordenado por rendimiento
     """
     try:
         team_data = await client.get_team_players()
         players = _extract_list(team_data)
         if not players:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No se encontraron jugadores en el equipo")
-        return _best_lineup_analysis(players)
+        return _best_lineup_analysis(players, target_apg=target)
     except HTTPException:
         raise
     except Exception as exc:
@@ -741,10 +824,16 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
                     rival_players.append(p)
 
         # ── 2. Calcular acciones de VENTA ─────────────────────────────────
-        # Ordenar mi plantilla por eficiencia ascendente y tomar el % inferior
+        # Ordenar mi plantilla por eficiencia ascendente
         sorted_mine = sorted(my_players, key=lambda p: _efficiency(p, "value"))
         sell_count = max(1, int(len(sorted_mine) * body.sell_bottom_pct))
-        sell_candidates = sorted_mine[:sell_count]
+        # Guardia de portero: nunca vender si es el único GK
+        gk_count = sum(1 for p in my_players if _primary_pos(p) == "GK")
+        sell_candidates = [
+            p for p in sorted_mine
+            if not (_primary_pos(p) == "GK" and gk_count <= 1)
+            and (body.sell_min_avg == 0 or _avg_per_game(p) < body.sell_min_avg)
+        ][:sell_count]
 
         sell_actions = []
         for p in sell_candidates:
@@ -796,9 +885,13 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
             buy_actions[-1]["_slug"] = slug
 
         # ── 4. Calcular acciones de ROBO por cláusula ─────────────────────
+        # Solo robar si el jugador mejora la media del equipo
+        my_min_avg = min((_avg_per_game(p) for p in my_players), default=0.0)
         steal_candidates = [
             p for p in rival_players
-            if _clause_price(p) > 0 and _efficiency(p, "clause") >= body.steal_min_efficiency
+            if _clause_price(p) > 0
+            and _efficiency(p, "clause") >= body.steal_min_efficiency
+            and _avg_per_game(p) > my_min_avg
         ]
         steal_candidates.sort(key=lambda p: _efficiency(p, "clause"), reverse=True)
 
@@ -865,15 +958,24 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
                 action.pop("_pid", None); action.pop("_slug", None); action.pop("_price", None)
 
         # ── 6. XI óptimo tras los cambios ─────────────────────────────────
-        lineup = _best_lineup_analysis(my_players)
+        lineup = _best_lineup_analysis(my_players, target_apg=body.target_jornada)
 
         # ── 7. Resumen ejecutivo ──────────────────────────────────────────
         estimated_income = sum(a["list_price"] for a in sell_actions)
         estimated_spend = sum(a["bid_price"] for a in buy_actions)
         steal_count_ok = sum(1 for a in steal_actions if a["status"] in ("ok", "pending"))
 
+        projected = lineup.get("projected_pts_jornada", 0)
         return {
             "dry_run": body.dry_run,
+            "target_progress": {
+                "target_pts_jornada": body.target_jornada,
+                "projected_pts_jornada": projected,
+                "gap": round(body.target_jornada - projected, 2),
+                "pct_reached": round(projected / body.target_jornada * 100, 1),
+                "avg_needed_per_player": round(body.target_jornada / 11, 2),
+                "current_avg_per_player": round(projected / 11, 2),
+            },
             "summary": {
                 "sell": len(sell_actions),
                 "buy": len(buy_actions),
