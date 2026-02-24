@@ -405,6 +405,7 @@ def _efficiency(player: dict, cost_key: str) -> float:
 
 def _player_summary(player: dict, action: str) -> dict:
     """Genera un resumen con los campos clave del jugador."""
+    buy_price = float(player.get("buyPrice") or 0)
     result = {
         "id": _get_field(player, "_id", "id"),
         "slug": player.get("slug"),
@@ -413,6 +414,7 @@ def _player_summary(player: dict, action: str) -> dict:
         "score": _get_field(player, "points", "score", "avg_score", "avgScore"),
         "avg_per_game": (player.get("average") or {}).get("average"),
         "value": _get_field(player, "value", "marketValue", "market_value"),
+        "buy_price": buy_price if buy_price else None,
         "team": _get_field(player, "team", "teamName", "team_name"),
         "efficiency": _efficiency(
             player,
@@ -749,10 +751,15 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
             pid = _get_field(p, "_id", "id")
             slug = p.get("slug")
             value = float(_get_field(p, "value", "marketValue") or 0)
-            price = max(1, int(value * (1 + body.sell_price_markup)))
+            buy_price = float(p.get("buyPrice") or 0)
+            # Nunca vender por debajo del precio de compra
+            base = max(value, buy_price)
+            price = max(1, int(base * (1 + body.sell_price_markup)))
             sell_actions.append({
                 "player": _player_summary(p, "sell"),
                 "list_price": price,
+                "buy_price": int(buy_price) if buy_price else None,
+                "market_value": int(value),
                 "status": "pending",
                 "error": None,
                 "response": None,
