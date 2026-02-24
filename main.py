@@ -134,8 +134,16 @@ class AutoRunRequest(BaseModel):
     buy_top: int = Field(5, ge=0, le=20, description="Máximo de jugadores a comprar del mercado")
     steal_top: int = Field(3, ge=0, le=10, description="Máximo de jugadores a robar por cláusula")
     steal_min_efficiency: float = Field(
-        2.0, ge=0.0,
-        description="Eficiencia mínima (avg_pts/jornada por millón) para considerar pagar la cláusula de un rival",
+        0.0, ge=0.0,
+        description="Eficiencia mínima (avg_pts/jornada por millón) — ignorar si steal_min_avg > 0",
+    )
+    steal_min_avg: float = Field(
+        7.0, ge=0.0,
+        description="Sólo robar jugadores con avg_per_game >= este valor. 0 = sin filtro por rendimiento",
+    )
+    steal_max_clause: float = Field(
+        0.0, ge=0.0,
+        description="Coste máximo de cláusula a pagar (0 = sin límite). Útil para controlar el gasto",
     )
     max_teams_scan: int = Field(8, ge=1, le=20, description="Equipos rivales a escanear en busca de objetivos")
     sell_min_avg: float = Field(
@@ -764,10 +772,18 @@ async def best_lineup(
 # ---------------------------------------------------------------------------
 
 async def _exec_action(coro, action: dict) -> None:
-    """Ejecuta una corutina y escribe el resultado en el dict de acción."""
+    """Ejecuta una corutina y escribe el resultado en el dict de acción.
+    Detecta errores de negocio de Futmondo (HTTP 200 con answer.error=true)."""
     try:
-        action["response"] = await coro
-        action["status"] = "ok"
+        result = await coro
+        action["response"] = result
+        # Futmondo devuelve HTTP 200 incluso para errores de negocio
+        answer = result.get("answer", {}) if isinstance(result, dict) else {}
+        if isinstance(answer, dict) and answer.get("error"):
+            action["status"] = "error"
+            action["error"] = answer.get("code", "api.error.unknown")
+        else:
+            action["status"] = "ok"
     except Exception as exc:
         action["status"] = "error"
         action["error"] = str(exc)
@@ -824,8 +840,11 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
                     rival_players.append(p)
 
         # ── 2. Calcular acciones de VENTA ─────────────────────────────────
-        # Ordenar mi plantilla por eficiencia ascendente
-        sorted_mine = sorted(my_players, key=lambda p: _efficiency(p, "value"))
+        # Excluir jugadores ya en el mercado (evitar error de doble listing)
+        sorted_mine = sorted(
+            [p for p in my_players if not p.get("market")],
+            key=lambda p: _efficiency(p, "value"),
+        )
         sell_count = max(1, int(len(sorted_mine) * body.sell_bottom_pct))
         # Guardia de portero: nunca vender si es el único GK
         gk_count = sum(1 for p in my_players if _primary_pos(p) == "GK")
@@ -885,15 +904,20 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
             buy_actions[-1]["_slug"] = slug
 
         # ── 4. Calcular acciones de ROBO por cláusula ─────────────────────
-        # Solo robar si el jugador mejora la media del equipo
-        my_min_avg = min((_avg_per_game(p) for p in my_players), default=0.0)
+        # Filtrar por rendimiento mínimo — ignoramos eficiencia si steal_min_avg > 0
         steal_candidates = [
             p for p in rival_players
             if _clause_price(p) > 0
-            and _efficiency(p, "clause") >= body.steal_min_efficiency
-            and _avg_per_game(p) > my_min_avg
+            and (body.steal_min_avg == 0 or _avg_per_game(p) >= body.steal_min_avg)
+            and (body.steal_min_efficiency == 0 or _efficiency(p, "clause") >= body.steal_min_efficiency)
+            and (body.steal_max_clause == 0 or _clause_price(p) <= body.steal_max_clause)
         ]
-        steal_candidates.sort(key=lambda p: _efficiency(p, "clause"), reverse=True)
+        # Ordenar por avg_per_game DESC: siempre robamos primero el mejor jugador
+        steal_candidates.sort(key=lambda p: _avg_per_game(p), reverse=True)
+
+        # Comprobar capacidad del roster: Futmondo limita a 12 jugadores
+        ROSTER_LIMIT = 12
+        roster_free = ROSTER_LIMIT - len(my_players)
 
         steal_actions = []
         for p in steal_candidates[: body.steal_top]:
@@ -902,13 +926,15 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
             c_price = int(_clause_price(p))
             steal_actions.append({
                 "player": _player_summary(p, "steal"),
-                "status": "pending",
-                "error": None,
+                "status": "pending" if roster_free > 0 else "skipped",
+                "error": None if roster_free > 0 else "roster_full: espera a que un comprador adquiera alguno de tus jugadores en venta",
                 "response": None,
             })
             steal_actions[-1]["_pid"] = pid
             steal_actions[-1]["_slug"] = slug
             steal_actions[-1]["_price"] = c_price
+            if roster_free > 0:
+                roster_free -= 1
 
         # ── 5. Ejecutar si no es simulación ───────────────────────────────
         if not body.dry_run:
@@ -966,8 +992,17 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
         steal_count_ok = sum(1 for a in steal_actions if a["status"] in ("ok", "pending"))
 
         projected = lineup.get("projected_pts_jornada", 0)
+        players_on_market = sum(1 for p in my_players if p.get("market"))
         return {
             "dry_run": body.dry_run,
+            "roster_status": {
+                "total": len(my_players),
+                "on_market": players_on_market,
+                "active": len(my_players) - players_on_market,
+                "limit": ROSTER_LIMIT,
+                "free_slots": max(0, ROSTER_LIMIT - len(my_players)),
+                "can_add_players": len(my_players) < ROSTER_LIMIT,
+            },
             "target_progress": {
                 "target_pts_jornada": body.target_jornada,
                 "projected_pts_jornada": projected,
@@ -998,6 +1033,15 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
+
+@app.get("/account", tags=["Sistema"])
+async def account_info(client: FutmondoClient = Depends(get_client)):
+    """Devuelve información de la cuenta: saldo de coins, estadísticas y equipos."""
+    try:
+        return await client.get_user_info()
+    except Exception as exc:
+        _handle_error(exc)
+
 
 @app.get("/health", tags=["Sistema"])
 async def health():

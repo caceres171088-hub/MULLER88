@@ -151,6 +151,10 @@ class FutmondoClient:
         """Obtiene información del campeonato y equipos."""
         return await self._post("GET_CHAMPIONSHIP_INFO")
 
+    async def get_user_info(self) -> dict:
+        """Obtiene información del usuario: saldo de coins, estadísticas, etc."""
+        return await self._post("USER_INFORMATION")
+
     async def get_market(self) -> dict:
         """Obtiene los jugadores disponibles en el mercado."""
         return await self._post("GET_MARKET", {"type": "market"})
