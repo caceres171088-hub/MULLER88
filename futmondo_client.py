@@ -72,9 +72,16 @@ class FutmondoAuth:
             raise ValueError(f"Login fallido: {code}")
 
         answer = login_data["answer"]
+        mobile = answer.get("mobile", {})
+        token = answer.get("token") or mobile.get("token")
+        userid = answer.get("userid") or answer.get("id") or mobile.get("userid")
+
+        if not token or not userid:
+            raise ValueError(f"Login: no se pudo extraer token/userid. Respuesta: {answer}")
+
         return {
-            "token": answer.get("token"),
-            "userid": answer.get("userid") or answer.get("id"),
+            "token": token,
+            "userid": userid,
             "raw": answer,
         }
 
