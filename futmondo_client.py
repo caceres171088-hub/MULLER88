@@ -194,11 +194,11 @@ class FutmondoClient:
             {"bid": bid_id, "player_id": player_id, "player_slug": player_slug, "price": price},
         )
 
-    async def pay_player_clause(self, player_id: str) -> dict:
+    async def pay_player_clause(self, player_id: str, player_slug: str, price: int) -> dict:
         """Paga la cláusula de un jugador para ficharlo."""
         return await self._post(
             "PAY_PLAYER_CLAUSE",
-            {"player_id": player_id},
+            {"player_id": player_id, "player_slug": player_slug, "price": price, "isClause": True},
         )
 
     async def get_player_data(self, player_id: str) -> dict:

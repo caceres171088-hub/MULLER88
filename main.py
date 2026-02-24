@@ -106,6 +106,11 @@ class ModifyBidRequest(BaseModel):
     price: int = Field(..., gt=0, description="Nuevo importe de la puja")
 
 
+class PayClauseRequest(BaseModel):
+    player_slug: str = Field(..., description="Slug del jugador (campo 'slug' del roster del equipo rival)")
+    price: int = Field(..., gt=0, description="Precio exacto de la cláusula (campo clause.price del jugador)")
+
+
 class AutoRunRequest(BaseModel):
     dry_run: bool = Field(
         True,
@@ -286,10 +291,19 @@ async def modify_bid(body: ModifyBidRequest, client: FutmondoClient = Depends(ge
 
 
 @app.post("/market/clause/{player_id}", tags=["Mercado"])
-async def pay_clause(player_id: str, client: FutmondoClient = Depends(get_client)):
-    """Paga la cláusula de un jugador para ficharlo directamente."""
+async def pay_clause(
+    player_id: str,
+    body: PayClauseRequest,
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    Paga la cláusula de un jugador para ficharlo directamente.
+
+    Necesitas el `player_slug` y el `price` (campo `clause.price`) del jugador,
+    obtenibles desde `GET /team/{team_id}` o `GET /player/{player_id}`.
+    """
     try:
-        return await client.pay_player_clause(player_id)
+        return await client.pay_player_clause(player_id, body.player_slug, body.price)
     except Exception as exc:
         _handle_error(exc)
 
@@ -519,7 +533,7 @@ def _normalize_pos(player: dict) -> str:
 
 
 def _score_val(player: dict) -> float:
-    return float(_get_field(player, "score", "avg_score", "avgScore", "points", "totalPoints") or 0)
+    return float(_get_field(player, "points", "score", "avg_score", "avgScore", "totalPoints") or 0)
 
 
 def _best_lineup_analysis(players: list[dict]) -> dict:
@@ -613,14 +627,15 @@ async def speculate(
                 "id": _get_field(p, "_id", "id"),
                 "slug": p.get("slug"),
                 "name": _get_field(p, "name", "playerName", "player_name"),
-                "position": _get_field(p, "position", "pos", "posicion"),
-                "score": _get_field(p, "score", "avg_score", "avgScore", "points"),
+                "position": _get_field(p, "role", "position", "pos"),
+                "score": _get_field(p, "points", "score", "avg_score", "avgScore"),
+                "avg_per_game": (p.get("average") or {}).get("average"),
                 "price": int(price),
                 "real_value": int(real_value),
                 "profit_absolute": int(real_value - price),
                 "profit_ratio": round(ratio, 4),
                 "team": _get_field(p, "team", "teamName", "team_name"),
-                "current_bid": _get_field(p, "bid", "bidPrice", "currentBid"),
+                "bids": _get_field(p, "numberOfBids", "bid"),
             })
 
         deals.sort(key=lambda d: d["profit_ratio"], reverse=True)
@@ -783,6 +798,8 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
         steal_actions = []
         for p in steal_candidates[: body.steal_top]:
             pid = _get_field(p, "_id", "id")
+            slug = p.get("slug")
+            c_price = int(_clause_price(p))
             steal_actions.append({
                 "player": _player_summary(p, "steal"),
                 "status": "pending",
@@ -790,6 +807,8 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
                 "response": None,
             })
             steal_actions[-1]["_pid"] = pid
+            steal_actions[-1]["_slug"] = slug
+            steal_actions[-1]["_price"] = c_price
 
         # ── 5. Ejecutar si no es simulación ───────────────────────────────
         if not body.dry_run:
@@ -822,11 +841,13 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
             # Luego robar por cláusula
             for action in steal_actions:
                 pid = action.pop("_pid", None)
-                if pid:
-                    await _exec_action(client.pay_player_clause(pid), action)
+                slug = action.pop("_slug", None)
+                price = action.pop("_price", None)
+                if pid and slug and price:
+                    await _exec_action(client.pay_player_clause(pid, slug, price), action)
                 else:
                     action["status"] = "error"
-                    action["error"] = "player_id no disponible"
+                    action["error"] = "player_id, slug o price de cláusula no disponible"
         else:
             # En dry_run limpiar los campos internos
             for action in sell_actions:
@@ -834,7 +855,7 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
             for action in buy_actions:
                 action.pop("_pid", None); action.pop("_slug", None)
             for action in steal_actions:
-                action.pop("_pid", None)
+                action.pop("_pid", None); action.pop("_slug", None); action.pop("_price", None)
 
         # ── 6. XI óptimo tras los cambios ─────────────────────────────────
         lineup = _best_lineup_analysis(my_players)
