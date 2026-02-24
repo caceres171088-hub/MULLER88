@@ -31,6 +31,7 @@ ENDPOINTS = {
     "GET_PLAYER_DATA": "/1/player/summary",
     "PAY_PLAYER_CLAUSE": "/1/market/rosterclause",
     "SET_BID": "/1/market/bid",
+    "MODIFY_BID": "/5/market/modifybid",
     "GET_TEAM_PLAYERS": "/1/userteam/roster",
     "PRESSROOM": "/1/locker/pressroom",
 }
@@ -158,11 +159,11 @@ class FutmondoClient:
         """Obtiene mis jugadores listados en el mercado."""
         return await self._post("GET_MY_PLAYERS_IN_MARKET")
 
-    async def set_player_in_market(self, player_id: str, price: int) -> dict:
+    async def set_player_in_market(self, player_id: str, player_slug: str, price: int) -> dict:
         """Pone un jugador a la venta en el mercado."""
         return await self._post(
             "SET_PLAYER_IN_MARKET",
-            {"player_id": player_id, "price": price},
+            {"player_id": player_id, "player_slug": player_slug, "price": price, "isClause": False},
         )
 
     async def remove_player_from_market(self, player_id: str) -> dict:
@@ -179,11 +180,18 @@ class FutmondoClient:
             {"player_id": player_id},
         )
 
-    async def set_bid(self, player_id: str, amount: int) -> dict:
-        """Realiza una puja por un jugador en el mercado."""
+    async def set_bid(self, player_id: str, player_slug: str, price: int) -> dict:
+        """Puja por un jugador en venta por otro equipo (cláusula/traspaso)."""
         return await self._post(
             "SET_BID",
-            {"player_id": player_id, "amount": amount},
+            {"player_id": player_id, "player_slug": player_slug, "price": price, "isClause": False},
+        )
+
+    async def modify_bid(self, bid_id: str, player_id: str, player_slug: str, price: int) -> dict:
+        """Modifica una puja existente en subasta del mercado automático."""
+        return await self._post(
+            "MODIFY_BID",
+            {"bid": bid_id, "player_id": player_id, "player_slug": player_slug, "price": price},
         )
 
     async def pay_player_clause(self, player_id: str) -> dict:

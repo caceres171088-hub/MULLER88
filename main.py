@@ -83,12 +83,21 @@ class LoginRequest(BaseModel):
 
 class SellPlayerRequest(BaseModel):
     player_id: str = Field(..., description="ID del jugador")
+    player_slug: str = Field(..., description="Slug numérico del jugador (campo 'slug' del roster)")
     price: int = Field(..., gt=0, description="Precio de venta en monedas")
 
 
 class BidRequest(BaseModel):
     player_id: str = Field(..., description="ID del jugador")
-    amount: int = Field(..., gt=0, description="Importe de la puja en monedas")
+    player_slug: str = Field(..., description="Slug numérico del jugador")
+    price: int = Field(..., gt=0, description="Importe de la puja en monedas")
+
+
+class ModifyBidRequest(BaseModel):
+    bid_id: str = Field(..., description="ID de la puja existente (campo 'bid.id' del mercado)")
+    player_id: str = Field(..., description="ID del jugador")
+    player_slug: str = Field(..., description="Slug numérico del jugador")
+    price: int = Field(..., gt=0, description="Nuevo importe de la puja")
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +205,7 @@ async def sell_player(
 ):
     """Pone un jugador a la venta en el mercado al precio indicado."""
     try:
-        return await client.set_player_in_market(body.player_id, body.price)
+        return await client.set_player_in_market(body.player_id, body.player_slug, body.price)
     except Exception as exc:
         _handle_error(exc)
 
@@ -225,9 +234,18 @@ async def toggle_player_visibility(
 
 @app.post("/market/bid", tags=["Mercado"])
 async def place_bid(body: BidRequest, client: FutmondoClient = Depends(get_client)):
-    """Realiza una puja por un jugador en el mercado."""
+    """Puja por un jugador en venta por otro equipo (traspaso/cláusula)."""
     try:
-        return await client.set_bid(body.player_id, body.amount)
+        return await client.set_bid(body.player_id, body.player_slug, body.price)
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@app.post("/market/bid/modify", tags=["Mercado"])
+async def modify_bid(body: ModifyBidRequest, client: FutmondoClient = Depends(get_client)):
+    """Modifica/sube una puja existente en la subasta del mercado automático."""
+    try:
+        return await client.modify_bid(body.bid_id, body.player_id, body.player_slug, body.price)
     except Exception as exc:
         _handle_error(exc)
 
