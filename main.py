@@ -22,7 +22,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from futmondo_client import FutmondoClient
+from futmondo_client import FutmondoAuth, FutmondoClient
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +76,11 @@ app.add_middleware(
 # Schemas
 # ---------------------------------------------------------------------------
 
+class LoginRequest(BaseModel):
+    mail: str = Field(..., description="Email de tu cuenta Futmondo")
+    pwd: str = Field(..., description="Contraseña de tu cuenta Futmondo")
+
+
 class SellPlayerRequest(BaseModel):
     player_id: str = Field(..., description="ID del jugador")
     price: int = Field(..., gt=0, description="Precio de venta en monedas")
@@ -101,6 +106,31 @@ def _handle_error(exc: Exception) -> None:
         status_code=status.HTTP_502_BAD_GATEWAY,
         detail=f"Error comunicando con Futmondo: {exc}",
     )
+
+
+# ---------------------------------------------------------------------------
+# Auth / Login
+# ---------------------------------------------------------------------------
+
+@app.post("/login", tags=["Auth"])
+async def login(body: LoginRequest):
+    """
+    Autentica con email y contraseña y devuelve el token y userid.
+
+    **Nota:** Solo funciona para cuentas con email/contraseña directo.
+    Si tu cuenta usa Microsoft, Google o Facebook OAuth, debes obtener
+    el token manualmente desde el navegador (ver README).
+    """
+    auth = FutmondoAuth()
+    try:
+        result = await auth.login(body.mail, body.pwd)
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
+    except Exception as exc:
+        _handle_error(exc)
+    finally:
+        await auth.close()
 
 
 # ---------------------------------------------------------------------------

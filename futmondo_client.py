@@ -15,6 +15,13 @@ TIMEOUT = 20.0
 
 # Endpoints de Futmondo
 ENDPOINTS = {
+    # Auth
+    "LOGIN_INITIAL": "/5/login/initial",
+    "LOGIN_WITH_MAIL": "/5/login/with_mail",
+    "LOGIN_MOBILE": "/1/login/mobile",
+    "USER_INFORMATION": "/1/user/information",
+    "CHAMPIONSHIP_INFORMATION": "/1/championship/information",
+    # Equipo
     "GET_CHAMPIONSHIP_INFO": "/2/championship/teams",
     "GET_MARKET": "/1/market/players",
     "GET_MY_PLAYERS_IN_MARKET": "/1/market/myplayers",
@@ -27,6 +34,52 @@ ENDPOINTS = {
     "GET_TEAM_PLAYERS": "/1/userteam/roster",
     "PRESSROOM": "/1/locker/pressroom",
 }
+
+
+class FutmondoAuth:
+    """Maneja la autenticación con Futmondo (cuentas con email/contraseña)."""
+
+    def __init__(self):
+        self.client = httpx.AsyncClient(base_url=FUTMONDO_BASE_URL, timeout=TIMEOUT)
+
+    async def login(self, mail: str, pwd: str) -> dict:
+        """
+        Autentica con email y contraseña.
+        Devuelve dict con token, userid y championships del usuario.
+        Nota: si la cuenta usa OAuth (Google, Microsoft, etc.) este método fallará.
+        """
+        # 1. Obtener token inicial de sesión
+        init_resp = await self.client.post(
+            ENDPOINTS["LOGIN_INITIAL"], json={"header": {}, "query": {}}
+        )
+        init_resp.raise_for_status()
+        init_data = init_resp.json()
+        session_token = init_data["answer"]["token"]
+
+        # 2. Login con email y contraseña
+        login_resp = await self.client.post(
+            ENDPOINTS["LOGIN_WITH_MAIL"],
+            json={
+                "header": {"token": session_token},
+                "query": {"mail": mail, "pwd": pwd},
+            },
+        )
+        login_resp.raise_for_status()
+        login_data = login_resp.json()
+
+        if login_data.get("answer", {}).get("error"):
+            code = login_data["answer"].get("code", "unknown")
+            raise ValueError(f"Login fallido: {code}")
+
+        answer = login_data["answer"]
+        return {
+            "token": answer.get("token"),
+            "userid": answer.get("userid") or answer.get("id"),
+            "raw": answer,
+        }
+
+    async def close(self):
+        await self.client.aclose()
 
 
 class FutmondoClient:
