@@ -23,6 +23,7 @@ Endpoints disponibles:
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -1095,6 +1096,179 @@ async def health():
 
 # ── Helpers de estadísticas ────────────────────────────────────────────────────
 LALIGA_TOTAL_JORNADAS = 38
+
+
+# ── Market Watch ───────────────────────────────────────────────────────────────
+
+def _parse_expiry(player: dict):
+    raw = player.get("expirationDate") or player.get("expires") or player.get("date")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _listing_status(player: dict, min_accept_ratio: float) -> dict:
+    """Analiza el estado de un listing: tiempo restante, mejor puja, recomendación."""
+    now        = datetime.now(timezone.utc)
+    expiry     = _parse_expiry(player)
+    buy_price  = float(player.get("buyPrice") or 0)
+    value      = float(player.get("value") or 0)
+    list_price = float(player.get("price") or 0)
+    bids       = player.get("bids") or []
+
+    # Mejor puja recibida
+    best_bid = 0.0
+    best_bidder = None
+    if isinstance(bids, list) and bids:
+        for b in bids:
+            amt = float(b.get("amount") or b.get("price") or b.get("bid") or 0)
+            if amt > best_bid:
+                best_bid    = amt
+                best_bidder = b.get("username") or b.get("user") or b.get("userId")
+
+    # Tiempo restante
+    hours_left = None
+    if expiry:
+        delta = expiry - now
+        hours_left = max(0.0, delta.total_seconds() / 3600)
+
+    # Umbral mínimo para aceptar: buyPrice × min_accept_ratio
+    min_accept = buy_price * min_accept_ratio
+
+    # Recomendación
+    if hours_left is not None and hours_left < 2 and best_bid == 0:
+        recommendation = "CANCELAR_URGENTE"   # expira pronto sin puja → recuperar jugador
+    elif hours_left is not None and hours_left < 6 and best_bid == 0:
+        recommendation = "CANCELAR"            # expira hoy sin puja → recuperar jugador
+    elif best_bid >= min_accept:
+        recommendation = "ACEPTAR_PUJA"        # hay oferta interesante
+    elif best_bid > 0 and best_bid < min_accept:
+        recommendation = "PUJA_BAJA"           # hay puja pero insuficiente
+    else:
+        recommendation = "ESPERAR"             # sin puja, tiempo suficiente
+
+    return {
+        "name":           player.get("name", "?"),
+        "role":           player.get("role", "?"),
+        "list_price":     int(list_price),
+        "buy_price":      int(buy_price),
+        "market_value":   int(value),
+        "best_bid":       int(best_bid),
+        "best_bidder":    best_bidder,
+        "num_bids":       len(bids) if isinstance(bids, list) else 0,
+        "expiry":         expiry.isoformat() if expiry else None,
+        "hours_left":     round(hours_left, 1) if hours_left is not None else None,
+        "min_accept":     int(min_accept),
+        "recommendation": recommendation,
+        "_id":            player.get("id") or player.get("_id"),
+        "_slug":          player.get("slug"),
+    }
+
+
+@app.get("/market/watch", tags=["Mercado"])
+async def market_watch(
+    min_accept_ratio: float = Query(
+        0.80, ge=0.0, le=1.0,
+        description="Ratio mínimo sobre buyPrice para considerar una puja interesante (0.80 = 80% del coste)"
+    ),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Vigila los listings activos: pujas recibidas, tiempo restante y recomendación.**
+
+    Para cada jugador en venta muestra:
+    - Mejor puja recibida y quién la hizo
+    - Tiempo hasta que expira el listing
+    - Recomendación: `ESPERAR` / `ACEPTAR_PUJA` / `PUJA_BAJA` / `CANCELAR` / `CANCELAR_URGENTE`
+
+    `min_accept_ratio` define el umbral de puja aceptable como fracción del buyPrice.
+    Ej: 0.80 → aceptar si la puja es ≥ 80% de lo que costó el jugador.
+    """
+    try:
+        raw = await client.get_my_players_in_market()
+    except Exception as exc:
+        _handle_error(exc)
+
+    listed = _extract_list(raw)
+    statuses = [_listing_status(p, min_accept_ratio) for p in listed]
+    statuses.sort(key=lambda s: (s["hours_left"] or 9999))  # más urgentes primero
+
+    urgent   = [s for s in statuses if s["recommendation"] in ("CANCELAR_URGENTE", "CANCELAR")]
+    accept   = [s for s in statuses if s["recommendation"] == "ACEPTAR_PUJA"]
+    low_bid  = [s for s in statuses if s["recommendation"] == "PUJA_BAJA"]
+    waiting  = [s for s in statuses if s["recommendation"] == "ESPERAR"]
+
+    return {
+        "min_accept_ratio": min_accept_ratio,
+        "summary": {
+            "total_listed":        len(statuses),
+            "urgent_cancel":       len(urgent),
+            "accept_bid":          len(accept),
+            "low_bid":             len(low_bid),
+            "waiting":             len(waiting),
+        },
+        "listings": statuses,
+    }
+
+
+@app.post("/market/watch/cancel-expired", tags=["Mercado"])
+async def cancel_expiring(
+    hours_threshold: float = Query(
+        3.0, ge=0.5, le=24.0,
+        description="Cancelar listings que expiren en menos de N horas SIN puja"
+    ),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Cancela automáticamente los listings que van a expirar sin puja.**
+
+    Si un listing expira sin ninguna puja, Futmondo se queda con el jugador.
+    Este endpoint cancela los listings en riesgo antes de que eso ocurra,
+    devolviendo el jugador a tu plantilla.
+
+    Sólo cancela listings con `num_bids == 0` y `hours_left < hours_threshold`.
+    """
+    try:
+        raw = await client.get_my_players_in_market()
+    except Exception as exc:
+        _handle_error(exc)
+
+    listed   = _extract_list(raw)
+    statuses = [_listing_status(p, 0.0) for p in listed]
+    to_cancel = [
+        s for s in statuses
+        if s["num_bids"] == 0
+        and s["hours_left"] is not None
+        and s["hours_left"] < hours_threshold
+    ]
+
+    results = []
+    for s in to_cancel:
+        pid    = s["_id"]
+        result = {"player": s["name"], "hours_left": s["hours_left"], "status": "pending", "error": None}
+        if pid:
+            try:
+                resp = await client.remove_player_from_market(pid)
+                ans  = resp.get("answer", {}) if isinstance(resp, dict) else {}
+                if isinstance(ans, dict) and ans.get("error"):
+                    result["status"] = "error"
+                    result["error"]  = ans.get("code", "unknown")
+                else:
+                    result["status"] = "cancelled"
+            except Exception as exc:
+                result["status"] = "error"
+                result["error"]  = str(exc)
+        results.append(result)
+
+    return {
+        "hours_threshold": hours_threshold,
+        "cancelled":       len([r for r in results if r["status"] == "cancelled"]),
+        "details":         results,
+        "message":         "Jugadores recuperados para tu plantilla" if results else "No hay listings urgentes sin puja",
+    }
 
 
 def _fitness(player: dict) -> list[float]:
