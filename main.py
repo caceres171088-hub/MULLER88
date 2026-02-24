@@ -860,8 +860,9 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
             slug = p.get("slug")
             value = float(_get_field(p, "value", "marketValue") or 0)
             buy_price = float(p.get("buyPrice") or 0)
-            # Nunca vender por debajo del precio de compra
-            base = max(value, buy_price)
+            # Usar el valor de mercado actual como base (no buyPrice): precio realista
+            # Si el buyPrice es mayor, limitamos la pérdida a lo que el mercado soporta
+            base = value if value > 0 else buy_price
             price = max(1, int(base * (1 + body.sell_price_markup)))
             sell_actions.append({
                 "player": _player_summary(p, "sell"),
@@ -915,10 +916,7 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
         # Ordenar por avg_per_game DESC: siempre robamos primero el mejor jugador
         steal_candidates.sort(key=lambda p: _avg_per_game(p), reverse=True)
 
-        # Comprobar capacidad del roster: Futmondo limita a 12 jugadores
-        ROSTER_LIMIT = 12
-        roster_free = ROSTER_LIMIT - len(my_players)
-
+        # Dejar que la API de Futmondo sea el árbitro del límite de roster
         steal_actions = []
         for p in steal_candidates[: body.steal_top]:
             pid = _get_field(p, "_id", "id")
@@ -926,15 +924,13 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
             c_price = int(_clause_price(p))
             steal_actions.append({
                 "player": _player_summary(p, "steal"),
-                "status": "pending" if roster_free > 0 else "skipped",
-                "error": None if roster_free > 0 else "roster_full: espera a que un comprador adquiera alguno de tus jugadores en venta",
+                "status": "pending",
+                "error": None,
                 "response": None,
             })
             steal_actions[-1]["_pid"] = pid
             steal_actions[-1]["_slug"] = slug
             steal_actions[-1]["_price"] = c_price
-            if roster_free > 0:
-                roster_free -= 1
 
         # ── 5. Ejecutar si no es simulación ───────────────────────────────
         if not body.dry_run:
@@ -993,15 +989,16 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
 
         projected = lineup.get("projected_pts_jornada", 0)
         players_on_market = sum(1 for p in my_players if p.get("market"))
+        steals_ok  = sum(1 for a in steal_actions if a.get("status") == "ok")
+        steals_err = sum(1 for a in steal_actions if a.get("status") == "error")
         return {
             "dry_run": body.dry_run,
             "roster_status": {
                 "total": len(my_players),
                 "on_market": players_on_market,
                 "active": len(my_players) - players_on_market,
-                "limit": ROSTER_LIMIT,
-                "free_slots": max(0, ROSTER_LIMIT - len(my_players)),
-                "can_add_players": len(my_players) < ROSTER_LIMIT,
+                "steals_succeeded": steals_ok,
+                "steals_failed": steals_err,
             },
             "target_progress": {
                 "target_pts_jornada": body.target_jornada,
@@ -1033,6 +1030,54 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
+
+@app.post("/market/reprice", tags=["Mercado"])
+async def reprice_market(
+    markup: float = Query(0.10, ge=0.0, le=1.0, description="Margen sobre valor de mercado (0.10 = +10%)"),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Re-lista todos tus jugadores en venta al precio de mercado actual + markup.**
+
+    Útil cuando los precios están desactualizados respecto al valor real.
+    Cancela el listing actual y vuelve a publicarlo al precio correcto.
+    Por defecto: `valor_mercado × 1.10`.
+    """
+    try:
+        raw = await client.get_my_players_in_market()
+    except Exception as exc:
+        _handle_error(exc)
+
+    listed = _extract_list(raw)
+    results = []
+    for p in listed:
+        pid   = _get_field(p, "_id", "id")
+        slug  = p.get("slug")
+        value = float(_get_field(p, "value", "marketValue") or 0)
+        old_price = float(_get_field(p, "price", "sellPrice") or 0)
+        new_price = max(1_000_000, int(value * (1 + markup)))
+
+        action = {"player": p.get("name", "?"), "old_price": int(old_price), "new_price": new_price, "status": "pending", "error": None}
+        if pid and slug and new_price != int(old_price):
+            # Retirar del mercado primero
+            try:
+                await client.remove_player_from_market(pid)
+            except Exception:
+                pass
+            # Re-listar al precio correcto
+            result = await client.set_player_in_market(pid, str(slug), new_price)
+            ans = result.get("answer", {}) if isinstance(result, dict) else {}
+            if isinstance(ans, dict) and ans.get("error"):
+                action["status"] = "error"
+                action["error"]  = ans.get("code", "unknown")
+            else:
+                action["status"] = "ok"
+        else:
+            action["status"] = "sin_cambios"
+        results.append(action)
+
+    return {"markup": markup, "repriced": len([r for r in results if r["status"] == "ok"]), "details": results}
+
 
 @app.get("/account", tags=["Sistema"])
 async def account_info(client: FutmondoClient = Depends(get_client)):
