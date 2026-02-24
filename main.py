@@ -1047,3 +1047,227 @@ async def account_info(client: FutmondoClient = Depends(get_client)):
 async def health():
     """Comprueba que la API está en funcionamiento."""
     return {"status": "ok", "service": "Futmondo Team Manager API"}
+
+
+# ── Helpers de estadísticas ────────────────────────────────────────────────────
+LALIGA_TOTAL_JORNADAS = 38
+
+
+def _fitness(player: dict) -> list[float]:
+    """Últimas N jornadas (scores individuales), de más antigua a más reciente."""
+    avg = player.get("average") or {}
+    return [float(x) for x in (avg.get("fitness") or []) if x is not None]
+
+
+def _trend(fitness: list[float]) -> str:
+    """Tendencia basada en últimas 5 jornadas vs media de temporada."""
+    if len(fitness) < 2:
+        return "sin_datos"
+    first_half = fitness[: len(fitness) // 2]
+    second_half = fitness[len(fitness) // 2:]
+    avg_first  = sum(first_half) / len(first_half)
+    avg_second = sum(second_half) / len(second_half)
+    diff = avg_second - avg_first
+    if diff >= 2:
+        return "subiendo"
+    if diff <= -2:
+        return "bajando"
+    return "estable"
+
+
+def _player_stats(p: dict, jornadas_restantes: int) -> dict:
+    """Genera un dict completo de estadísticas + previsión para un jugador."""
+    avg      = (p.get("average") or {})
+    season_avg   = float(avg.get("average") or 0)
+    last5_avg    = float(avg.get("averageLastFive") or season_avg)
+    home_avg     = float(avg.get("homeAverage") or season_avg)
+    away_avg     = float(avg.get("awayAverage") or season_avg)
+    matches      = int(avg.get("matches") or 0)
+    total_pts    = float(p.get("points") or 0)
+    fitness      = _fitness(p)
+    trend        = _trend(fitness)
+    value        = float(p.get("value") or 0)
+    buyPrice     = float(p.get("buyPrice") or 0)
+    on_market    = bool(p.get("market"))
+
+    # Previsión: conservadora=last5, realista=season_avg, optimista=max(home,last5)
+    forecast_conservative = round(last5_avg * jornadas_restantes, 1)
+    forecast_realistic    = round(season_avg * jornadas_restantes, 1)
+    forecast_optimistic   = round(max(home_avg, last5_avg, season_avg) * 1.10 * jornadas_restantes, 1)
+
+    roi = round((value - buyPrice) / buyPrice * 100, 1) if buyPrice else None
+
+    return {
+        "name":         p.get("name", "?"),
+        "role":         p.get("role", "?"),
+        "role2":        p.get("role2"),
+        "team":         p.get("team", "?"),
+        "on_market":    on_market,
+        "stats": {
+            "season_avg":     round(season_avg, 2),
+            "last5_avg":      round(last5_avg, 2),
+            "home_avg":       round(home_avg, 2),
+            "away_avg":       round(away_avg, 2),
+            "matches_played": matches,
+            "total_pts":      round(total_pts, 1),
+            "fitness":        fitness,   # últimas 5 jornadas individuales
+            "trend":          trend,
+        },
+        "value": {
+            "current": value,
+            "buy_price": buyPrice,
+            "roi_pct": roi,
+        },
+        "forecast": {
+            "jornadas_restantes": jornadas_restantes,
+            "conservative":  forecast_conservative,   # basado en last5
+            "realistic":     forecast_realistic,       # basado en season_avg
+            "optimistic":    forecast_optimistic,      # +10% sobre mejor escenario
+        },
+    }
+
+
+@app.get("/stats/squad", tags=["Estadísticas"])
+async def stats_squad(
+    jornadas_played: int = Query(None, description="Jornadas jugadas (auto si omitido)"),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Análisis completo del equipo jornada a jornada.**
+
+    Devuelve para cada jugador:
+    - Media de temporada y últimas 5 jornadas (fitness individual)
+    - Medias en casa / fuera
+    - Tendencia (subiendo / estable / bajando)
+    - Previsión realista, conservadora y optimista de puntos restantes
+    - ROI de la inversión (valor actual vs precio de compra)
+
+    El equipo se ordena por `season_avg` descendente.
+    """
+    try:
+        raw = await client.get_team_players()
+    except Exception as exc:
+        _handle_error(exc)
+
+    players = _extract_list(raw)
+
+    # Estimar jornadas jugadas a partir de la media de matches del equipo
+    if jornadas_played is None:
+        all_matches = [int((p.get("average") or {}).get("matches") or 0) for p in players]
+        jornadas_played = int(sum(all_matches) / len(all_matches)) if all_matches else 22
+    jornadas_restantes = max(0, LALIGA_TOTAL_JORNADAS - jornadas_played)
+
+    stats = [_player_stats(p, jornadas_restantes) for p in players]
+    stats.sort(key=lambda s: s["stats"]["season_avg"], reverse=True)
+
+    # Resumen del equipo
+    active = [s for s in stats if not s["on_market"]]
+    all_avgs = [s["stats"]["season_avg"] for s in stats]
+    active_avgs = [s["stats"]["season_avg"] for s in active]
+    xi_analysis = _best_lineup_analysis(players)
+
+    summary = {
+        "jornadas_played":    jornadas_played,
+        "jornadas_remaining": jornadas_restantes,
+        "squad_size":         len(stats),
+        "active_players":     len(active),
+        "team_avg_jornada":   round(sum(all_avgs) / len(all_avgs), 2) if all_avgs else 0,
+        "xi_projected_avg":   xi_analysis.get("projected_pts_jornada", 0),
+        "xi_formation":       xi_analysis.get("formation"),
+        "forecast_realistic": round(xi_analysis.get("projected_pts_jornada", 0) * jornadas_restantes, 1),
+        "target_150":         150,
+        "gap_to_150":         round(150 - xi_analysis.get("projected_pts_jornada", 0), 2),
+    }
+
+    return {"summary": summary, "players": stats}
+
+
+@app.get("/stats/targets", tags=["Estadísticas"])
+async def stats_targets(
+    jornadas_played: int = Query(None, description="Jornadas jugadas (auto si omitido)"),
+    top: int = Query(20, ge=5, le=50, description="Nº de objetivos a devolver"),
+    min_avg: float = Query(7.0, ge=0.0, description="Media mínima por jornada"),
+    max_clause: float = Query(0, ge=0, description="Cláusula máxima en €  (0 = sin límite)"),
+    max_teams: int = Query(20, ge=1, le=50),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Análisis de los mejores jugadores disponibles para fichar.**
+
+    Escanea todos los equipos rivales y devuelve los mejores jugadores por:
+    - Media por jornada (season_avg y últimas 5)
+    - Tendencia de forma
+    - Previsión de puntos que aportarían al equipo
+    - Coste por cláusula
+
+    Filtros: `min_avg`, `max_clause`.
+    """
+    try:
+        champ_raw = await client.get_championship_info()
+    except Exception as exc:
+        _handle_error(exc)
+
+    champ_data = _extract_list(champ_raw) or []
+    if isinstance(champ_raw, dict):
+        inner = champ_raw.get("answer", champ_raw)
+        if isinstance(inner, dict):
+            champ_data = inner.get("teams", [])
+
+    my_team_id = client.user_team_id
+    rival_ids = [
+        t.get("teamid") or t.get("id") or t.get("_id")
+        for t in champ_data
+        if (t.get("teamid") or t.get("id") or t.get("_id")) != my_team_id
+    ][:max_teams]
+
+    # Obtener plantillas rivales en paralelo
+    async def fetch_team(tid: str) -> list[dict]:
+        try:
+            raw = await client.get_team_players(team_id=tid)
+            return _extract_list(raw)
+        except Exception:
+            return []
+
+    all_teams = await asyncio.gather(*[fetch_team(tid) for tid in rival_ids])
+    my_raw = await client.get_team_players()
+    my_ids = {_get_field(p, "_id", "id") for p in _extract_list(my_raw)}
+
+    # Estimar jornadas jugadas
+    all_players_flat = [p for team in all_teams for p in team]
+    if jornadas_played is None:
+        all_matches = [int((p.get("average") or {}).get("matches") or 0) for p in all_players_flat if p]
+        jornadas_played = int(sum(all_matches) / len(all_matches)) if all_matches else 22
+    jornadas_restantes = max(0, LALIGA_TOTAL_JORNADAS - jornadas_played)
+
+    targets = []
+    for team_players in all_teams:
+        for p in team_players:
+            pid = _get_field(p, "_id", "id")
+            if pid in my_ids:
+                continue
+            avg = _avg_per_game(p)
+            if avg < min_avg:
+                continue
+            clause = _clause_price(p)
+            if max_clause and clause > max_clause:
+                continue
+            if clause <= 0:
+                continue
+
+            s = _player_stats(p, jornadas_restantes)
+            s["id"]           = pid
+            s["slug"]         = p.get("slug")
+            s["clause_price"] = clause
+            s["efficiency"]   = _efficiency(p, "clause")
+            targets.append(s)
+
+    targets.sort(key=lambda x: x["stats"]["season_avg"], reverse=True)
+    targets = targets[:top]
+
+    return {
+        "jornadas_played":    jornadas_played,
+        "jornadas_remaining": jornadas_restantes,
+        "total_found":        len(targets),
+        "filters":            {"min_avg": min_avg, "max_clause": max_clause or "sin_límite"},
+        "targets":            targets,
+    }
