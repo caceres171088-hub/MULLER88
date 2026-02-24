@@ -98,6 +98,43 @@ Parámetros opcionales de `/strategy/speculate`:
 |---|---|---|
 | GET | `/health` | Estado de la API |
 
+### Automatización
+| Método | Ruta | Descripción |
+|---|---|---|
+| POST | `/auto/run` | Piloto automático: vende, especula y roba sin intervención |
+
+## Piloto automático — hace todo solo
+
+```bash
+# 1. Primero simula para ver el plan (dry_run=true por defecto)
+curl -X POST http://localhost:8000/auto/run \
+  -H "Content-Type: application/json" \
+  -d '{"dry_run": true}'
+
+# 2. Cuando el plan te convence, ejecuta de verdad
+curl -X POST http://localhost:8000/auto/run \
+  -H "Content-Type: application/json" \
+  -d '{"dry_run": false}'
+```
+
+El endpoint hace todo en orden:
+1. Vende el 25% peor de tu plantilla al 110% de su valor
+2. Compra los jugadores del mercado con más descuento sobre su valor real
+3. Roba por cláusula a los jugadores más eficientes de equipos rivales
+4. Devuelve el XI óptimo para la próxima jornada
+
+Parámetros configurables:
+| Parámetro | Por defecto | Descripción |
+|---|---|---|
+| `dry_run` | `true` | Solo simula, no ejecuta |
+| `sell_bottom_pct` | `0.25` | Vende el 25% inferior de tu plantilla |
+| `sell_price_markup` | `0.10` | Vende al 110% del valor |
+| `buy_min_profit` | `0.10` | Solo compra si hay ≥10% de descuento |
+| `buy_top` | `5` | Máximo 5 jugadores a comprar |
+| `steal_top` | `3` | Máximo 3 robos por cláusula |
+| `steal_min_efficiency` | `2.0` | Eficiencia mínima para robar |
+| `max_teams_scan` | `8` | Equipos rivales a escanear |
+
 ## Guía para ganar dinero y construir el equipo ganador
 
 ### 1. Especular en el mercado (ganar dinero)

@@ -18,6 +18,7 @@ Endpoints disponibles:
   GET  /strategy                  - Recomendaciones: vender, comprar, robar
   GET  /strategy/speculate        - Oportunidades de especulación en el mercado
   GET  /strategy/lineup           - XI óptimo para máximos puntos por jornada
+  POST /auto/run                  - Piloto automático: vende, especula y roba sin intervención
 """
 
 import asyncio
@@ -103,6 +104,35 @@ class ModifyBidRequest(BaseModel):
     player_id: str = Field(..., description="ID del jugador")
     player_slug: str = Field(..., description="Slug numérico del jugador")
     price: int = Field(..., gt=0, description="Nuevo importe de la puja")
+
+
+class AutoRunRequest(BaseModel):
+    dry_run: bool = Field(
+        True,
+        description=(
+            "Si True (por defecto) solo simula y muestra el plan sin ejecutar nada. "
+            "Pon False para ejecutar de verdad."
+        ),
+    )
+    sell_bottom_pct: float = Field(
+        0.25, ge=0.0, le=1.0,
+        description="Vende el X% inferior de tu plantilla por eficiencia (0.25 = 25% peores)",
+    )
+    sell_price_markup: float = Field(
+        0.10, ge=0.0, le=5.0,
+        description="Precio de venta = valor_jugador × (1 + markup). 0.10 = 10% sobre valor",
+    )
+    buy_min_profit: float = Field(
+        0.10, ge=0.0, le=10.0,
+        description="Mínimo de descuento para comprar un jugador del mercado (0.10 = 10% bajo su valor real)",
+    )
+    buy_top: int = Field(5, ge=0, le=20, description="Máximo de jugadores a comprar del mercado")
+    steal_top: int = Field(3, ge=0, le=10, description="Máximo de jugadores a robar por cláusula")
+    steal_min_efficiency: float = Field(
+        2.0, ge=0.0,
+        description="Eficiencia mínima (pts/millón) para considerar pagar la cláusula de un rival",
+    )
+    max_teams_scan: int = Field(8, ge=1, le=20, description="Equipos rivales a escanear en busca de objetivos")
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +640,212 @@ async def best_lineup(client: FutmondoClient = Depends(get_client)):
         return _best_lineup_analysis(players)
     except HTTPException:
         raise
+    except Exception as exc:
+        _handle_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Piloto automático
+# ---------------------------------------------------------------------------
+
+async def _exec_action(coro, action: dict) -> None:
+    """Ejecuta una corutina y escribe el resultado en el dict de acción."""
+    try:
+        action["response"] = await coro
+        action["status"] = "ok"
+    except Exception as exc:
+        action["status"] = "error"
+        action["error"] = str(exc)
+
+
+@app.post("/auto/run", tags=["Automatización"])
+async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_client)):
+    """
+    **Piloto automático — hace todo solo.**
+
+    Recopila datos en paralelo, calcula el plan óptimo y, si `dry_run=False`,
+    ejecuta cada acción en orden: primero vende, luego compra en el mercado,
+    luego roba por cláusula. Finalmente devuelve el XI óptimo actualizado.
+
+    **Flujo automático:**
+    1. Obtiene tu plantilla, el mercado y los equipos rivales.
+    2. **VENDE** tus jugadores con peor eficiencia (libera presupuesto).
+    3. **COMPRA** del mercado los jugadores más infravalorados (especulación).
+    4. **ROBA** por cláusula los mejores jugadores de equipos rivales.
+    5. Devuelve el **XI óptimo** para la próxima jornada.
+
+    Empieza con `dry_run=true` para ver el plan antes de ejecutarlo.
+    """
+    try:
+        # ── 1. Recopilar datos en paralelo ────────────────────────────────
+        team_data, market_data, championship_data = await asyncio.gather(
+            client.get_team_players(),
+            client.get_market(),
+            client.get_championship_info(),
+        )
+
+        my_players = _extract_list(team_data)
+        my_ids = {_get_field(p, "_id", "id") for p in my_players if _get_field(p, "_id", "id")}
+        market_players = _extract_list(market_data)
+
+        # Rosters rivales en paralelo
+        all_teams = _extract_list(championship_data)
+        rival_ids = [
+            tid for t in all_teams
+            if (tid := _get_field(t, "_id", "id", "userteamId")) and tid != client.user_team_id
+        ][:body.max_teams_scan]
+
+        rival_results = await asyncio.gather(
+            *[client.get_team_players(team_id=tid) for tid in rival_ids],
+            return_exceptions=True,
+        )
+        rival_players: list[dict] = []
+        for res in rival_results:
+            if isinstance(res, Exception):
+                continue
+            for p in _extract_list(res):
+                pid = _get_field(p, "_id", "id")
+                if pid and pid not in my_ids:
+                    rival_players.append(p)
+
+        # ── 2. Calcular acciones de VENTA ─────────────────────────────────
+        # Ordenar mi plantilla por eficiencia ascendente y tomar el % inferior
+        sorted_mine = sorted(my_players, key=lambda p: _efficiency(p, "value"))
+        sell_count = max(1, int(len(sorted_mine) * body.sell_bottom_pct))
+        sell_candidates = sorted_mine[:sell_count]
+
+        sell_actions = []
+        for p in sell_candidates:
+            pid = _get_field(p, "_id", "id")
+            slug = p.get("slug")
+            value = float(_get_field(p, "value", "marketValue") or 0)
+            price = max(1, int(value * (1 + body.sell_price_markup)))
+            sell_actions.append({
+                "player": _player_summary(p, "sell"),
+                "list_price": price,
+                "status": "pending",
+                "error": None,
+                "response": None,
+            })
+            sell_actions[-1]["_pid"] = pid
+            sell_actions[-1]["_slug"] = slug
+
+        # ── 3. Calcular acciones de COMPRA (especulación) ─────────────────
+        buy_deals = []
+        for p in market_players:
+            price = float(_get_field(p, "price", "sell_price", "sellPrice") or 0)
+            real_value = float(_get_field(p, "value", "marketValue", "clause") or 0)
+            if price <= 0 or real_value <= price:
+                continue
+            ratio = (real_value - price) / price
+            if ratio < body.buy_min_profit:
+                continue
+            buy_deals.append((ratio, p, int(price)))
+        buy_deals.sort(key=lambda x: x[0], reverse=True)
+
+        buy_actions = []
+        for ratio, p, price in buy_deals[: body.buy_top]:
+            pid = _get_field(p, "_id", "id")
+            slug = p.get("slug")
+            buy_actions.append({
+                "player": _player_summary(p, "buy"),
+                "bid_price": price,
+                "profit_ratio": round(ratio, 4),
+                "status": "pending",
+                "error": None,
+                "response": None,
+            })
+            buy_actions[-1]["_pid"] = pid
+            buy_actions[-1]["_slug"] = slug
+
+        # ── 4. Calcular acciones de ROBO por cláusula ─────────────────────
+        steal_candidates = [
+            p for p in rival_players
+            if _efficiency(p, "clause") >= body.steal_min_efficiency
+        ]
+        steal_candidates.sort(key=lambda p: _efficiency(p, "clause"), reverse=True)
+
+        steal_actions = []
+        for p in steal_candidates[: body.steal_top]:
+            pid = _get_field(p, "_id", "id")
+            steal_actions.append({
+                "player": _player_summary(p, "steal"),
+                "status": "pending",
+                "error": None,
+                "response": None,
+            })
+            steal_actions[-1]["_pid"] = pid
+
+        # ── 5. Ejecutar si no es simulación ───────────────────────────────
+        if not body.dry_run:
+            # Primero vender (libera presupuesto)
+            for action in sell_actions:
+                pid = action.pop("_pid", None)
+                slug = action.pop("_slug", None)
+                if pid and slug:
+                    await _exec_action(
+                        client.set_player_in_market(pid, slug, action["list_price"]),
+                        action,
+                    )
+                else:
+                    action["status"] = "error"
+                    action["error"] = "player_id o slug no disponible"
+
+            # Luego comprar
+            for action in buy_actions:
+                pid = action.pop("_pid", None)
+                slug = action.pop("_slug", None)
+                if pid and slug:
+                    await _exec_action(
+                        client.set_bid(pid, slug, action["bid_price"]),
+                        action,
+                    )
+                else:
+                    action["status"] = "error"
+                    action["error"] = "player_id o slug no disponible"
+
+            # Luego robar por cláusula
+            for action in steal_actions:
+                pid = action.pop("_pid", None)
+                if pid:
+                    await _exec_action(client.pay_player_clause(pid), action)
+                else:
+                    action["status"] = "error"
+                    action["error"] = "player_id no disponible"
+        else:
+            # En dry_run limpiar los campos internos
+            for action in sell_actions:
+                action.pop("_pid", None); action.pop("_slug", None)
+            for action in buy_actions:
+                action.pop("_pid", None); action.pop("_slug", None)
+            for action in steal_actions:
+                action.pop("_pid", None)
+
+        # ── 6. XI óptimo tras los cambios ─────────────────────────────────
+        lineup = _best_lineup_analysis(my_players)
+
+        # ── 7. Resumen ejecutivo ──────────────────────────────────────────
+        estimated_income = sum(a["list_price"] for a in sell_actions)
+        estimated_spend = sum(a["bid_price"] for a in buy_actions)
+        steal_count_ok = sum(1 for a in steal_actions if a["status"] in ("ok", "pending"))
+
+        return {
+            "dry_run": body.dry_run,
+            "summary": {
+                "sell": len(sell_actions),
+                "buy": len(buy_actions),
+                "steal": len(steal_actions),
+                "estimated_income": estimated_income,
+                "estimated_spend": estimated_spend,
+                "net_cash_flow": estimated_income - estimated_spend,
+            },
+            "actions": {
+                "sell": sell_actions,
+                "buy": buy_actions,
+                "steal": steal_actions,
+            },
+            "lineup": lineup,
+        }
     except Exception as exc:
         _handle_error(exc)
 
