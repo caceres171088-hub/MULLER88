@@ -366,13 +366,27 @@ def _get_field(player: dict, *keys):
     return None
 
 
+def _clause_price(player: dict) -> float:
+    """Extrae el precio de cláusula correctamente (puede ser dict o número)."""
+    clause = player.get("clause")
+    if isinstance(clause, dict):
+        return float(clause.get("price") or clause.get("suggestedClause") or 0)
+    if clause is not None:
+        return float(clause)
+    return 0.0
+
+
 def _efficiency(player: dict, cost_key: str) -> float:
     """Puntos por millón de coste. Cuanto mayor, mejor valor."""
-    score = _get_field(player, "score", "avg_score", "avgScore", "points", "totalPoints") or 0
-    cost = _get_field(player, cost_key, "value", "marketValue", "clause") or 0
+    score = float(_get_field(player, "points", "score", "avg_score", "avgScore", "totalPoints") or 0)
+    if cost_key == "clause":
+        cost = _clause_price(player)
+    else:
+        raw = _get_field(player, cost_key, "value", "marketValue") or 0
+        cost = float(raw) if not isinstance(raw, dict) else 0.0
     if not cost or cost == 0:
         return 0.0
-    return round(float(score) / (float(cost) / 1_000_000), 4)
+    return round(score / (cost / 1_000_000), 4)
 
 
 def _player_summary(player: dict, action: str) -> dict:
@@ -381,8 +395,9 @@ def _player_summary(player: dict, action: str) -> dict:
         "id": _get_field(player, "_id", "id"),
         "slug": player.get("slug"),
         "name": _get_field(player, "name", "playerName", "player_name"),
-        "position": _get_field(player, "position", "pos", "posicion"),
-        "score": _get_field(player, "score", "avg_score", "avgScore", "points"),
+        "position": _get_field(player, "role", "position", "pos"),
+        "score": _get_field(player, "points", "score", "avg_score", "avgScore"),
+        "avg_per_game": (player.get("average") or {}).get("average"),
         "value": _get_field(player, "value", "marketValue", "market_value"),
         "team": _get_field(player, "team", "teamName", "team_name"),
         "efficiency": _efficiency(
@@ -392,10 +407,10 @@ def _player_summary(player: dict, action: str) -> dict:
         "action": action,
     }
     if action == "steal":
-        result["clause"] = _get_field(player, "clause", "clauseValue")
+        result["clause_price"] = _clause_price(player)
     if action == "buy":
         result["price"] = _get_field(player, "price", "sell_price", "sellPrice")
-        result["current_bid"] = _get_field(player, "bid", "bidPrice", "currentBid")
+        result["bids"] = _get_field(player, "numberOfBids", "bid", "bidPrice")
     return result
 
 
@@ -487,19 +502,19 @@ _FORMATIONS = [
 ]
 
 _POS_MAP = {
-    # Portero
-    "gk": "GK", "por": "GK", "portero": "GK", "goalkeeper": "GK", "1": "GK",
+    # Portero (campo 'role' en Futmondo)
+    "portero": "GK", "gk": "GK", "por": "GK", "goalkeeper": "GK", "1": "GK",
     # Defensa
-    "def": "DEF", "defensa": "DEF", "defender": "DEF", "2": "DEF",
+    "defensa": "DEF", "def": "DEF", "defender": "DEF", "2": "DEF",
     # Centrocampista
-    "mid": "MID", "cen": "MID", "centrocampista": "MID", "midfielder": "MID", "3": "MID",
+    "centrocampista": "MID", "mid": "MID", "cen": "MID", "midfielder": "MID", "3": "MID",
     # Delantero
-    "fwd": "FWD", "del": "FWD", "delantero": "FWD", "forward": "FWD", "4": "FWD",
+    "delantero": "FWD", "fwd": "FWD", "del": "FWD", "forward": "FWD", "4": "FWD",
 }
 
 
 def _normalize_pos(player: dict) -> str:
-    raw = _get_field(player, "position", "pos", "posicion") or ""
+    raw = _get_field(player, "role", "role2", "position", "pos") or ""
     return _POS_MAP.get(str(raw).lower(), str(raw).upper() or "UNK")
 
 
@@ -761,7 +776,7 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
         # ── 4. Calcular acciones de ROBO por cláusula ─────────────────────
         steal_candidates = [
             p for p in rival_players
-            if _efficiency(p, "clause") >= body.steal_min_efficiency
+            if _clause_price(p) > 0 and _efficiency(p, "clause") >= body.steal_min_efficiency
         ]
         steal_candidates.sort(key=lambda p: _efficiency(p, "clause"), reverse=True)
 
