@@ -1096,6 +1096,246 @@ async def health():
 
 # ── Helpers de estadísticas ────────────────────────────────────────────────────
 LALIGA_TOTAL_JORNADAS = 38
+STARTING_BUDGET       = 200_000_000
+MONEY_PER_POINT       = 150_000
+
+
+# ── Rivals intelligence ────────────────────────────────────────────────────────
+
+@app.get("/rivals/intel", tags=["Inteligencia"])
+async def rivals_intel(
+    max_teams: int = Query(20, ge=1, le=50),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Inteligencia de rivales — presupuesto estimado y perfil de cada equipo.**
+
+    Para cada equipo rival calcula:
+    - **Presupuesto estimado**: inicio(200M) + puntos×150k − valor_compra_plantilla_actual
+    - **Gasto total en jugadores**: suma de buyPrices de su roster
+    - **Jugador más caro**: el que más dinero ha invertido en un jugador
+    - **Media del XI**: para compararnos con ellos
+
+    Permite saber quién tiene dinero para robarnos jugadores o pujar en el mercado.
+    """
+    try:
+        champ_raw = await client.get_championship_info()
+    except Exception as exc:
+        _handle_error(exc)
+
+    inner       = champ_raw.get("answer", champ_raw) if isinstance(champ_raw, dict) else {}
+    champ_teams = inner.get("teams", []) if isinstance(inner, dict) else []
+    my_id       = client.user_team_id
+
+    async def fetch_roster(tid: str) -> list[dict]:
+        try:
+            raw = await client.get_team_players(team_id=tid)
+            return _extract_list(raw)
+        except Exception:
+            return []
+
+    team_ids = [t.get("teamid") or t.get("id") for t in champ_teams][:max_teams]
+    rosters  = await asyncio.gather(*[fetch_roster(tid) for tid in team_ids])
+
+    result = []
+    for team_info, roster in zip(champ_teams, rosters):
+        tid        = team_info.get("teamid") or team_info.get("id")
+        pts        = float(team_info.get("points") or 0)
+        team_value = float(team_info.get("teamValue") or 0)
+        is_me      = tid == my_id
+
+        total_invested = sum(float(p.get("buyPrice") or 0) for p in roster)
+        money_earned   = STARTING_BUDGET + pts * MONEY_PER_POINT
+        estimated_cash = money_earned - total_invested   # aproximación
+
+        avgs   = [_avg_per_game(p) for p in roster if _avg_per_game(p) > 0]
+        xi_avg = round(sorted(avgs, reverse=True)[:11].__add__([0]*11)[0:11] and
+                       sum(sorted(avgs, reverse=True)[:11]) / min(11, len(avgs)), 2) if avgs else 0
+
+        most_expensive = max(roster, key=lambda p: float(p.get("buyPrice") or 0), default=None)
+        on_market_cnt  = sum(1 for p in roster if p.get("market"))
+
+        result.append({
+            "team":             team_info.get("teamname") or team_info.get("name", "?"),
+            "is_me":            is_me,
+            "points":           pts,
+            "team_value":       int(team_value),
+            "roster_size":      len(roster),
+            "on_market":        on_market_cnt,
+            "total_invested":   int(total_invested),
+            "money_earned_est": int(money_earned),
+            "cash_available_est": int(max(0, estimated_cash)),
+            "xi_avg":           xi_avg,
+            "most_expensive_player": {
+                "name":      most_expensive.get("name") if most_expensive else None,
+                "buy_price": int(float(most_expensive.get("buyPrice") or 0)) if most_expensive else 0,
+                "avg":       _avg_per_game(most_expensive) if most_expensive else 0,
+            } if most_expensive else None,
+        })
+
+    result.sort(key=lambda x: x["cash_available_est"], reverse=True)
+    return {
+        "league_config": {"starting_budget": STARTING_BUDGET, "money_per_point": MONEY_PER_POINT},
+        "rivals": result,
+    }
+
+
+@app.get("/market/bids", tags=["Inteligencia"])
+async def market_bids(
+    min_avg: float = Query(0.0, description="Solo jugadores con avg ≥ este valor"),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Escáner de pujas del mercado — ve quién está pujando qué.**
+
+    Escanea todos los jugadores en el mercado y muestra las pujas activas:
+    - Quién puja, cuánto y cuántas pujas hay
+    - Tiempo restante del listing
+    - Si el jugador nos interesa (avg alta)
+
+    Útil para saber qué rivales tienen dinero y en qué jugadores lo gastan.
+    """
+    try:
+        raw = await client.get_market()
+    except Exception as exc:
+        _handle_error(exc)
+
+    market_players = _extract_list(raw)
+    now = datetime.now(timezone.utc)
+
+    active_auctions = []
+    for p in market_players:
+        avg    = _avg_per_game(p)
+        if avg < min_avg:
+            continue
+        bids   = p.get("bids") or []
+        price  = float(_get_field(p, "price", "sellPrice") or 0)
+        value  = float(p.get("value") or 0)
+        expiry = _parse_expiry(p)
+        hours  = None
+        if expiry:
+            delta = expiry - now
+            hours = max(0.0, delta.total_seconds() / 3600)
+
+        bid_list = []
+        if isinstance(bids, list):
+            for b in bids:
+                bid_list.append({
+                    "bidder":  b.get("username") or b.get("user") or b.get("userId") or "?",
+                    "amount":  int(float(b.get("amount") or b.get("price") or b.get("bid") or 0)),
+                    "team":    b.get("teamName") or b.get("team") or "?",
+                })
+            bid_list.sort(key=lambda b: b["amount"], reverse=True)
+
+        best_bid = bid_list[0]["amount"] if bid_list else 0
+
+        active_auctions.append({
+            "name":        p.get("name") or p.get("playerName", "?"),
+            "role":        p.get("role") or p.get("position", "?"),
+            "team_club":   p.get("team") or p.get("teamName", "?"),
+            "avg_per_game": round(avg, 2),
+            "list_price":  int(price),
+            "market_value": int(value),
+            "best_bid":    best_bid,
+            "num_bids":    len(bid_list),
+            "bids":        bid_list,
+            "hours_left":  round(hours, 1) if hours is not None else None,
+            "expiry":      expiry.isoformat() if expiry else None,
+        })
+
+    active_auctions.sort(key=lambda x: x["avg_per_game"], reverse=True)
+    with_bids    = [a for a in active_auctions if a["num_bids"] > 0]
+    without_bids = [a for a in active_auctions if a["num_bids"] == 0]
+
+    return {
+        "total_in_market": len(active_auctions),
+        "with_active_bids":   len(with_bids),
+        "without_bids":       len(without_bids),
+        "auctions": active_auctions,
+    }
+
+
+class SnipeRequest(BaseModel):
+    player_id:   str   = Field(..., description="ID del jugador a snipear")
+    player_slug: str   = Field(..., description="Slug del jugador")
+    max_price:   int   = Field(..., description="Precio máximo que pagamos")
+    snipe_seconds: int = Field(30, ge=5, le=300,
+                               description="Segundos antes de expirar en que pujamos")
+
+
+@app.post("/market/snipe", tags=["Inteligencia"])
+async def snipe_player(body: SnipeRequest, client: FutmondoClient = Depends(get_client)):
+    """
+    **Sniper de subastas — puja en el último segundo.**
+
+    Espera hasta `snipe_seconds` antes del vencimiento del listing y entonces puja,
+    evitando que los rivales puedan reaccionar y contra-pujar.
+
+    Estrategia: pujar en los últimos 30s = el rival no tiene tiempo de subir.
+
+    El precio ofertado es `mejor_puja_actual + 1` (mínimo para ganar) hasta `max_price`.
+    Si la puja actual ya supera `max_price`, no puja.
+    """
+    try:
+        raw = await client.get_market()
+    except Exception as exc:
+        _handle_error(exc)
+
+    market_players = _extract_list(raw)
+    target = next(
+        (p for p in market_players
+         if _get_field(p, "_id", "id") == body.player_id or str(p.get("slug")) == body.player_slug),
+        None
+    )
+
+    if not target:
+        raise HTTPException(status_code=404, detail="Jugador no encontrado en el mercado")
+
+    expiry = _parse_expiry(target)
+    now    = datetime.now(timezone.utc)
+
+    if not expiry:
+        raise HTTPException(status_code=400, detail="El jugador no tiene fecha de expiración")
+
+    seconds_left = (expiry - now).total_seconds()
+    if seconds_left <= 0:
+        raise HTTPException(status_code=400, detail="El listing ya ha expirado")
+
+    bids     = target.get("bids") or []
+    best_bid = max((float(b.get("amount") or b.get("bid") or 0) for b in bids), default=0)
+    my_bid   = int(best_bid) + 1 if best_bid > 0 else int(float(_get_field(target, "price", "sellPrice") or 0))
+
+    if my_bid > body.max_price:
+        return {
+            "status":      "skip",
+            "reason":      f"Puja actual {my_bid:,.0f} supera tu máximo {body.max_price:,.0f}",
+            "current_bid": int(best_bid),
+            "max_price":   body.max_price,
+        }
+
+    wait_seconds = max(0, seconds_left - body.snipe_seconds)
+
+    if wait_seconds > 0:
+        await asyncio.sleep(min(wait_seconds, 300))   # máximo 5 min de espera en una sola llamada
+
+    # Puja final
+    try:
+        resp = await client.set_bid(body.player_id, body.player_slug, my_bid)
+    except Exception as exc:
+        _handle_error(exc)
+
+    ans = resp.get("answer", {}) if isinstance(resp, dict) else {}
+    if isinstance(ans, dict) and ans.get("error"):
+        return {"status": "error", "error": ans.get("code"), "bid_attempted": my_bid}
+
+    return {
+        "status":        "sniped",
+        "player":        target.get("name") or target.get("playerName"),
+        "bid_placed":    my_bid,
+        "previous_best": int(best_bid),
+        "waited_seconds": int(wait_seconds),
+        "expiry":        expiry.isoformat(),
+    }
 
 
 # ── Clause helpers ─────────────────────────────────────────────────────────────
