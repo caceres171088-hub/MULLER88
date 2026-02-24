@@ -860,9 +860,8 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
             slug = p.get("slug")
             value = float(_get_field(p, "value", "marketValue") or 0)
             buy_price = float(p.get("buyPrice") or 0)
-            # Usar el valor de mercado actual como base (no buyPrice): precio realista
-            # Si el buyPrice es mayor, limitamos la pérdida a lo que el mercado soporta
-            base = value if value > 0 else buy_price
+            # Nunca vender por debajo del precio de compra
+            base = max(value, buy_price)
             price = max(1, int(base * (1 + body.sell_price_markup)))
             sell_actions.append({
                 "player": _player_summary(p, "sell"),
