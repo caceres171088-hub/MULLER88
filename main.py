@@ -1098,6 +1098,209 @@ async def health():
 LALIGA_TOTAL_JORNADAS = 38
 
 
+# ── Clause helpers ─────────────────────────────────────────────────────────────
+
+def _clause_expiry(player: dict):
+    cl = player.get("clause")
+    if isinstance(cl, dict):
+        raw = cl.get("date") or cl.get("expires")
+        if raw:
+            try:
+                return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except Exception:
+                return None
+    return None
+
+
+def _clause_hours_left(player: dict) -> float | None:
+    expiry = _clause_expiry(player)
+    if not expiry:
+        return None
+    delta = expiry - datetime.now(timezone.utc)
+    return max(0.0, delta.total_seconds() / 3600)
+
+
+def _steal_risk(player: dict) -> str:
+    """Riesgo de que un rival nos robe este jugador."""
+    clause_val = _clause_price(player)
+    hours      = _clause_hours_left(player)
+    avg        = _avg_per_game(player)
+    if hours is None or hours <= 0:
+        return "EXPIRADA"          # ya no pueden robárnoslo por esta cláusula
+    if clause_val < 20_000_000 and hours < 72:
+        return "CRITICO"
+    if clause_val < 50_000_000 and hours < 48:
+        return "ALTO"
+    if clause_val < 100_000_000:
+        return "MEDIO"
+    return "BAJO"
+
+
+@app.get("/defense", tags=["Estrategia"])
+async def defense_alert(client: FutmondoClient = Depends(get_client)):
+    """
+    **Alerta defensiva — jugadores nuestros en riesgo de ser robados.**
+
+    Muestra nuestra plantilla ordenada por riesgo de robo:
+    - Cláusula baja + expira pronto = CRITICO (rival puede robarlo hoy)
+    - El día antes de jornada es cuando más robos ocurren
+
+    Riesgos: CRITICO / ALTO / MEDIO / BAJO / EXPIRADA
+    """
+    try:
+        raw = await client.get_team_players()
+    except Exception as exc:
+        _handle_error(exc)
+
+    players = _extract_list(raw)
+    now     = datetime.now(timezone.utc)
+
+    risk_order = {"CRITICO": 0, "ALTO": 1, "MEDIO": 2, "BAJO": 3, "EXPIRADA": 4}
+    result = []
+    for p in players:
+        cl         = p.get("clause") or {}
+        c_price    = _clause_price(p)
+        c_suggest  = cl.get("suggestedClause", 0) if isinstance(cl, dict) else 0
+        c_expiry   = _clause_expiry(p)
+        hours_left = _clause_hours_left(p)
+        risk       = _steal_risk(p)
+        result.append({
+            "name":           p.get("name", "?"),
+            "role":           p.get("role", "?"),
+            "avg_per_game":   _avg_per_game(p),
+            "on_market":      bool(p.get("market")),
+            "clause_price":   int(c_price),
+            "clause_suggest": int(c_suggest),
+            "clause_expires": c_expiry.isoformat() if c_expiry else None,
+            "hours_until_expiry": round(hours_left, 1) if hours_left is not None else None,
+            "risk":           risk,
+            "value":          float(p.get("value") or 0),
+        })
+
+    result.sort(key=lambda x: (risk_order.get(x["risk"], 9), x["clause_price"]))
+
+    criticos = [r for r in result if r["risk"] == "CRITICO"]
+    altos    = [r for r in result if r["risk"] == "ALTO"]
+
+    return {
+        "generated_at": now.isoformat(),
+        "summary": {
+            "CRITICO": len(criticos),
+            "ALTO":    len(altos),
+            "MEDIO":   len([r for r in result if r["risk"] == "MEDIO"]),
+            "BAJO":    len([r for r in result if r["risk"] == "BAJO"]),
+        },
+        "alert": "¡Actúa antes de que roben tus jugadores!" if criticos or altos else "Sin amenazas inmediatas",
+        "players": result,
+    }
+
+
+@app.get("/attack", tags=["Estrategia"])
+async def pre_jornada_attack(
+    max_clause:  float = Query(300_000_000, description="Cláusula máxima que estamos dispuestos a pagar"),
+    min_avg:     float = Query(7.0,         description="Media mínima del jugador objetivo"),
+    hours_window: float = Query(48.0,       description="Horas antes de jornada para actuar (ventana de ataque)"),
+    max_teams:   int   = Query(20, ge=1, le=50),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Plan de ataque pre-jornada — jugadores rivales para robar y dejarles con -5 pts.**
+
+    El día antes de que empiece una jornada, robar los mejores jugadores de los rivales:
+    - Ellos pierden el jugador → -5 pts esa jornada
+    - Nosotros ganamos un jugador con alta media
+
+    Ordena por impacto máximo: jugadores con **avg alta** y **cláusula asequible**.
+    Filtra por ventana temporal: cláusulas que expiren en menos de `hours_window` horas
+    son las que se pueden activar ahora mismo.
+    """
+    try:
+        champ_raw = await client.get_championship_info()
+    except Exception as exc:
+        _handle_error(exc)
+
+    inner = champ_raw.get("answer", champ_raw) if isinstance(champ_raw, dict) else {}
+    champ_teams = inner.get("teams", []) if isinstance(inner, dict) else []
+    my_id = client.user_team_id
+
+    rival_ids = [
+        t.get("teamid") or t.get("id")
+        for t in champ_teams
+        if (t.get("teamid") or t.get("id")) != my_id
+    ][:max_teams]
+
+    # Nombre del equipo por id
+    team_name_by_id = {
+        t.get("teamid") or t.get("id"): t.get("teamname") or t.get("name", "?")
+        for t in champ_teams
+    }
+
+    async def fetch(tid):
+        try:
+            raw = await client.get_team_players(team_id=tid)
+            return tid, _extract_list(raw)
+        except Exception:
+            return tid, []
+
+    my_raw  = await client.get_team_players()
+    my_ids  = {_get_field(p, "_id", "id") for p in _extract_list(my_raw)}
+
+    all_results = await asyncio.gather(*[fetch(tid) for tid in rival_ids])
+
+    now = datetime.now(timezone.utc)
+    targets = []
+    for tid, team_players in all_results:
+        team_name = team_name_by_id.get(tid, "?")
+        for p in team_players:
+            pid = _get_field(p, "_id", "id")
+            if pid in my_ids:
+                continue
+            avg      = _avg_per_game(p)
+            c_price  = _clause_price(p)
+            cl       = p.get("clause") or {}
+            transferred = cl.get("transferred", False) if isinstance(cl, dict) else False
+            if transferred or c_price <= 0 or c_price > max_clause or avg < min_avg:
+                continue
+
+            hours = _clause_hours_left(p)
+            c_expiry = _clause_expiry(p)
+
+            # Impacto = cuántos puntos le quitamos al rival si lo robamos
+            # (pierde avg/j × jornadas_restantes + penalización -5 por jornada inmediata)
+            impact_score = avg * 2 + 5   # avg en la jornada + los -5 que le metemos
+
+            targets.append({
+                "name":              p.get("name", "?"),
+                "role":              p.get("role", "?"),
+                "team":              team_name,
+                "avg_per_game":      round(avg, 2),
+                "last5_avg":         round(float((p.get("average") or {}).get("averageLastFive") or avg), 2),
+                "clause_price":      int(c_price),
+                "clause_expires":    c_expiry.isoformat() if c_expiry else None,
+                "hours_left":        round(hours, 1) if hours is not None else None,
+                "can_steal_now":     (hours is not None and hours > 0),
+                "impact_score":      round(impact_score, 2),
+                "id":                pid,
+                "slug":              p.get("slug"),
+            })
+
+    # Ordenar: primero los de mayor avg, luego por cláusula más baja
+    targets.sort(key=lambda x: (-x["avg_per_game"], x["clause_price"]))
+
+    # Separar los que se pueden robar ahora vs los que no
+    can_now  = [t for t in targets if t["can_steal_now"]]
+    cant_now = [t for t in targets if not t["can_steal_now"]]
+
+    return {
+        "generated_at":    now.isoformat(),
+        "filters":         {"max_clause": max_clause, "min_avg": min_avg, "hours_window": hours_window},
+        "total_targets":   len(targets),
+        "stealable_now":   len(can_now),
+        "attack_plan":     can_now[:15],
+        "expiry_soon":     [t for t in can_now if t["hours_left"] is not None and t["hours_left"] < hours_window][:10],
+    }
+
+
 # ── Market Watch ───────────────────────────────────────────────────────────────
 
 def _parse_expiry(player: dict):
