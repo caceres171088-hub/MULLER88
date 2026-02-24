@@ -81,32 +81,67 @@ Documentación interactiva (Swagger): `http://localhost:8000/docs`
 ### Estrategia
 | Método | Ruta | Descripción |
 |---|---|---|
-| GET | `/strategy` | Recomendaciones: vender, comprar y robar jugadores |
+| GET | `/strategy` | Recomendaciones generales: vender, comprar y robar |
+| GET | `/strategy/speculate` | Oportunidades de especulación en el mercado |
+| GET | `/strategy/lineup` | XI óptimo para máximos puntos por jornada |
 
 Parámetros opcionales de `/strategy`:
 - `top` (por defecto 10): número de recomendaciones por categoría
 - `max_teams` (por defecto 8): equipos rivales a escanear para cláusulas
+
+Parámetros opcionales de `/strategy/speculate`:
+- `top` (por defecto 15): número de oportunidades a devolver
+- `min_discount` (por defecto 0.05): descuento mínimo sobre valor real (0.10 = 10%)
 
 ### Sistema
 | Método | Ruta | Descripción |
 |---|---|---|
 | GET | `/health` | Estado de la API |
 
-## Estrategia para maximizar tu límite
+## Guía para ganar dinero y construir el equipo ganador
 
-Llama a `GET /strategy` para obtener un análisis completo:
+### 1. Especular en el mercado (ganar dinero)
+
+```bash
+curl "http://localhost:8000/strategy/speculate?top=15&min_discount=0.10"
+```
+
+Devuelve jugadores en el mercado por debajo de su valor real. Ordenados por `profit_ratio` (mayor = mayor margen):
+
+| Campo | Descripción |
+|---|---|
+| `price` | Precio actual en el mercado |
+| `real_value` | Valor o cláusula real del jugador |
+| `profit_absolute` | Ganancia bruta estimada |
+| `profit_ratio` | Rentabilidad: (real_value - price) / price |
+
+Flujo especulación: **compra** (`POST /market/bid`) → el jugador sube de valor → **vende** (`POST /market/sell`)
+
+### 2. Maximizar límite con la estrategia completa
 
 ```bash
 curl "http://localhost:8000/strategy?top=10&max_teams=8"
 ```
 
-La respuesta incluye tres listas ordenadas por **eficiencia (puntos / millón €)**:
+Tres listas ordenadas por **eficiencia (puntos / millón €)**:
 
 | Campo | Qué hacer | Endpoint |
 |---|---|---|
 | `sell` | Vende estos jugadores (bajo rendimiento por su valor) | `POST /market/sell` |
 | `buy` | Compra estos jugadores del mercado (máximo valor por precio) | `POST /market/bid` |
 | `steal` | Roba estos jugadores de rivales pagando la cláusula | `POST /market/clause/{id}` |
+
+### 3. XI óptimo para ganar jornadas
+
+```bash
+curl "http://localhost:8000/strategy/lineup"
+```
+
+Analiza tu plantilla, prueba 7 formaciones y devuelve el once con mayor total de puntos:
+- `formation`: la mejor formación (ej. "4-3-3")
+- `total_score`: suma de puntos de los 11 titulares
+- `starters`: los 11 titulares
+- `bench`: suplentes ordenados por rendimiento
 
 ## Ejemplo de uso
 

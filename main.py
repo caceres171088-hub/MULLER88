@@ -16,6 +16,8 @@ Endpoints disponibles:
   GET  /pressroom                 - Sala de prensa del equipo
   GET  /budget                    - Saldo y límite salarial del equipo
   GET  /strategy                  - Recomendaciones: vender, comprar, robar
+  GET  /strategy/speculate        - Oportunidades de especulación en el mercado
+  GET  /strategy/lineup           - XI óptimo para máximos puntos por jornada
 """
 
 import asyncio
@@ -435,6 +437,179 @@ async def get_strategy(
             "buy": [_player_summary(p, "buy") for p in buy],
             "steal": [_player_summary(p, "steal") for p in steal],
         }
+    except Exception as exc:
+        _handle_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Especulación y alineación óptima
+# ---------------------------------------------------------------------------
+
+# Formaciones habituales: {DEF, MID, FWD} – siempre 1 portero
+_FORMATIONS = [
+    {"name": "4-3-3", "DEF": 4, "MID": 3, "FWD": 3},
+    {"name": "4-4-2", "DEF": 4, "MID": 4, "FWD": 2},
+    {"name": "4-5-1", "DEF": 4, "MID": 5, "FWD": 1},
+    {"name": "3-5-2", "DEF": 3, "MID": 5, "FWD": 2},
+    {"name": "3-4-3", "DEF": 3, "MID": 4, "FWD": 3},
+    {"name": "5-3-2", "DEF": 5, "MID": 3, "FWD": 2},
+    {"name": "5-4-1", "DEF": 5, "MID": 4, "FWD": 1},
+]
+
+_POS_MAP = {
+    # Portero
+    "gk": "GK", "por": "GK", "portero": "GK", "goalkeeper": "GK", "1": "GK",
+    # Defensa
+    "def": "DEF", "defensa": "DEF", "defender": "DEF", "2": "DEF",
+    # Centrocampista
+    "mid": "MID", "cen": "MID", "centrocampista": "MID", "midfielder": "MID", "3": "MID",
+    # Delantero
+    "fwd": "FWD", "del": "FWD", "delantero": "FWD", "forward": "FWD", "4": "FWD",
+}
+
+
+def _normalize_pos(player: dict) -> str:
+    raw = _get_field(player, "position", "pos", "posicion") or ""
+    return _POS_MAP.get(str(raw).lower(), str(raw).upper() or "UNK")
+
+
+def _score_val(player: dict) -> float:
+    return float(_get_field(player, "score", "avg_score", "avgScore", "points", "totalPoints") or 0)
+
+
+def _best_lineup_analysis(players: list[dict]) -> dict:
+    """Prueba todas las formaciones y devuelve el XI con mayor total de puntos."""
+    by_pos: dict[str, list[dict]] = {"GK": [], "DEF": [], "MID": [], "FWD": []}
+    for p in players:
+        pos = _normalize_pos(p)
+        if pos in by_pos:
+            by_pos[pos].append(p)
+    for pos in by_pos:
+        by_pos[pos].sort(key=_score_val, reverse=True)
+
+    best: dict | None = None
+    best_total = -1.0
+
+    for f in _FORMATIONS:
+        slots = {"GK": 1, "DEF": f["DEF"], "MID": f["MID"], "FWD": f["FWD"]}
+        # Verificar que hay suficientes jugadores en cada posición
+        if any(len(by_pos[pos]) < slots[pos] for pos in slots):
+            continue
+        selected = []
+        for pos, n in slots.items():
+            selected.extend(by_pos[pos][:n])
+        total = sum(_score_val(p) for p in selected)
+        if total > best_total:
+            best_total = total
+            best = {
+                "formation": f["name"],
+                "total_score": round(total, 2),
+                "starters": [_player_summary(p, "lineup") for p in selected],
+            }
+
+    if best is None:
+        # Fallback: devolver los 11 mejores sin filtrar por formación
+        top11 = sorted(players, key=_score_val, reverse=True)[:11]
+        best = {
+            "formation": "libre",
+            "total_score": round(sum(_score_val(p) for p in top11), 2),
+            "starters": [_player_summary(p, "lineup") for p in top11],
+        }
+
+    # Suplentes = resto de jugadores no en el XI, ordenados por puntos
+    starter_ids = {s["id"] for s in best["starters"]}
+    bench = sorted(
+        [p for p in players if _get_field(p, "_id", "id") not in starter_ids],
+        key=_score_val,
+        reverse=True,
+    )
+    best["bench"] = [_player_summary(p, "lineup") for p in bench]
+    return best
+
+
+@app.get("/strategy/speculate", tags=["Estrategia"])
+async def speculate(
+    top: int = Query(15, ge=1, le=50, description="Número de oportunidades a devolver"),
+    min_discount: float = Query(0.05, ge=0.0, le=1.0, description="Descuento mínimo sobre el valor real (0.05 = 5%)"),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Especulación: compra barato y vende caro para ganar dinero.**
+
+    Escanea el mercado y devuelve los jugadores que cotizan POR DEBAJO de su
+    valor real (cláusula o valor de mercado). Cuanto mayor sea `profit_ratio`,
+    mayor es el margen de beneficio potencial.
+
+    Estrategia:
+    1. Compra los jugadores de esta lista (`POST /market/bid` o `POST /market/clause/{id}`).
+    2. Espera a que su valor suba (buen rendimiento en jornadas).
+    3. Véndelos en el mercado (`POST /market/sell`) por encima del precio de compra.
+
+    Campos de la respuesta:
+    - `price`: precio de compra en el mercado ahora mismo
+    - `real_value`: valor / cláusula real del jugador
+    - `profit_absolute`: beneficio bruto estimado (real_value - price)
+    - `profit_ratio`: rentabilidad porcentual ((real_value - price) / price)
+    """
+    try:
+        market_data = await client.get_market()
+        players = _extract_list(market_data)
+
+        deals = []
+        for p in players:
+            price = float(_get_field(p, "price", "sell_price", "sellPrice") or 0)
+            real_value = float(_get_field(p, "value", "marketValue", "clause") or 0)
+            if price <= 0 or real_value <= price:
+                continue
+            ratio = (real_value - price) / price
+            if ratio < min_discount:
+                continue
+            deals.append({
+                "id": _get_field(p, "_id", "id"),
+                "slug": p.get("slug"),
+                "name": _get_field(p, "name", "playerName", "player_name"),
+                "position": _get_field(p, "position", "pos", "posicion"),
+                "score": _get_field(p, "score", "avg_score", "avgScore", "points"),
+                "price": int(price),
+                "real_value": int(real_value),
+                "profit_absolute": int(real_value - price),
+                "profit_ratio": round(ratio, 4),
+                "team": _get_field(p, "team", "teamName", "team_name"),
+                "current_bid": _get_field(p, "bid", "bidPrice", "currentBid"),
+            })
+
+        deals.sort(key=lambda d: d["profit_ratio"], reverse=True)
+        return {
+            "total_opportunities": len(deals),
+            "shown": min(top, len(deals)),
+            "deals": deals[:top],
+        }
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@app.get("/strategy/lineup", tags=["Estrategia"])
+async def best_lineup(client: FutmondoClient = Depends(get_client)):
+    """
+    **XI óptimo para máximos puntos por jornada.**
+
+    Analiza tu plantilla completa y prueba todas las formaciones posibles
+    (4-3-3, 4-4-2, 4-5-1, 3-5-2, 3-4-3, 5-3-2, 5-4-1).
+
+    Devuelve:
+    - `formation`: la formación con mayor total de puntos
+    - `total_score`: suma de puntos de los 11 titulares
+    - `starters`: los 11 titulares con su posición y puntos
+    - `bench`: el resto de tu plantilla ordenado por rendimiento
+    """
+    try:
+        team_data = await client.get_team_players()
+        players = _extract_list(team_data)
+        if not players:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No se encontraron jugadores en el equipo")
+        return _best_lineup_analysis(players)
+    except HTTPException:
+        raise
     except Exception as exc:
         _handle_error(exc)
 
