@@ -73,10 +73,40 @@ Documentación interactiva (Swagger): `http://localhost:8000/docs`
 |---|---|---|
 | GET | `/pressroom` | Noticias del equipo |
 
+### Finanzas
+| Método | Ruta | Descripción |
+|---|---|---|
+| GET | `/budget` | Saldo disponible y límite salarial |
+
+### Estrategia
+| Método | Ruta | Descripción |
+|---|---|---|
+| GET | `/strategy` | Recomendaciones: vender, comprar y robar jugadores |
+
+Parámetros opcionales de `/strategy`:
+- `top` (por defecto 10): número de recomendaciones por categoría
+- `max_teams` (por defecto 8): equipos rivales a escanear para cláusulas
+
 ### Sistema
 | Método | Ruta | Descripción |
 |---|---|---|
 | GET | `/health` | Estado de la API |
+
+## Estrategia para maximizar tu límite
+
+Llama a `GET /strategy` para obtener un análisis completo:
+
+```bash
+curl "http://localhost:8000/strategy?top=10&max_teams=8"
+```
+
+La respuesta incluye tres listas ordenadas por **eficiencia (puntos / millón €)**:
+
+| Campo | Qué hacer | Endpoint |
+|---|---|---|
+| `sell` | Vende estos jugadores (bajo rendimiento por su valor) | `POST /market/sell` |
+| `buy` | Compra estos jugadores del mercado (máximo valor por precio) | `POST /market/bid` |
+| `steal` | Roba estos jugadores de rivales pagando la cláusula | `POST /market/clause/{id}` |
 
 ## Ejemplo de uso
 

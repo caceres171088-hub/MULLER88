@@ -14,11 +14,14 @@ Endpoints disponibles:
   POST /market/clause/{player_id} - Pagar cláusula de un jugador
   GET  /player/{player_id}        - Datos de un jugador
   GET  /pressroom                 - Sala de prensa del equipo
+  GET  /budget                    - Saldo y límite salarial del equipo
+  GET  /strategy                  - Recomendaciones: vender, comprar, robar
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -281,6 +284,157 @@ async def get_pressroom(client: FutmondoClient = Depends(get_client)):
     """Devuelve las noticias y novedades del equipo en la sala de prensa."""
     try:
         return await client.get_pressroom()
+    except Exception as exc:
+        _handle_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Finanzas
+# ---------------------------------------------------------------------------
+
+@app.get("/budget", tags=["Finanzas"])
+async def get_budget(client: FutmondoClient = Depends(get_client)):
+    """
+    Devuelve el saldo disponible, límite salarial y estado financiero de tu equipo.
+
+    Úsalo para saber cuánto dinero tienes para fichar y cuánto margen salarial te queda.
+    """
+    try:
+        return await client.get_user_info()
+    except Exception as exc:
+        _handle_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Estrategia
+# ---------------------------------------------------------------------------
+
+def _extract_list(data: dict | list) -> list[dict]:
+    """Extrae la lista principal de jugadores/equipos de la respuesta de Futmondo."""
+    if isinstance(data, list):
+        return [p for p in data if isinstance(p, dict)]
+    if "answer" in data:
+        data = data["answer"]
+    if isinstance(data, list):
+        return [p for p in data if isinstance(p, dict)]
+    # Busca la primera lista de dicts con campos típicos de jugador
+    for val in data.values():
+        if isinstance(val, list) and val and isinstance(val[0], dict):
+            if any(f in val[0] for f in ["_id", "id", "name", "slug", "value", "clause"]):
+                return val
+    return []
+
+
+def _get_field(player: dict, *keys):
+    """Devuelve el primer valor no-None de los campos dados."""
+    for k in keys:
+        v = player.get(k)
+        if v is not None:
+            return v
+    return None
+
+
+def _efficiency(player: dict, cost_key: str) -> float:
+    """Puntos por millón de coste. Cuanto mayor, mejor valor."""
+    score = _get_field(player, "score", "avg_score", "avgScore", "points", "totalPoints") or 0
+    cost = _get_field(player, cost_key, "value", "marketValue", "clause") or 0
+    if not cost or cost == 0:
+        return 0.0
+    return round(float(score) / (float(cost) / 1_000_000), 4)
+
+
+def _player_summary(player: dict, action: str) -> dict:
+    """Genera un resumen con los campos clave del jugador."""
+    result = {
+        "id": _get_field(player, "_id", "id"),
+        "slug": player.get("slug"),
+        "name": _get_field(player, "name", "playerName", "player_name"),
+        "position": _get_field(player, "position", "pos", "posicion"),
+        "score": _get_field(player, "score", "avg_score", "avgScore", "points"),
+        "value": _get_field(player, "value", "marketValue", "market_value"),
+        "team": _get_field(player, "team", "teamName", "team_name"),
+        "efficiency": _efficiency(
+            player,
+            "price" if action == "buy" else ("clause" if action == "steal" else "value"),
+        ),
+        "action": action,
+    }
+    if action == "steal":
+        result["clause"] = _get_field(player, "clause", "clauseValue")
+    if action == "buy":
+        result["price"] = _get_field(player, "price", "sell_price", "sellPrice")
+        result["current_bid"] = _get_field(player, "bid", "bidPrice", "currentBid")
+    return result
+
+
+@app.get("/strategy", tags=["Estrategia"])
+async def get_strategy(
+    top: int = Query(10, ge=1, le=25, description="Número de recomendaciones por categoría"),
+    max_teams: int = Query(8, ge=1, le=20, description="Máximo de equipos rivales a analizar para cláusulas"),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Estrategia para construir el equipo ganador y maximizar tu límite.**
+
+    Analiza en paralelo tu plantilla, el mercado y los equipos rivales y devuelve
+    tres listas ordenadas por eficiencia (puntos / millón de €):
+
+    - **sell** – Tus jugadores con peor relación puntos/valor: véndelos para liberar presupuesto.
+    - **buy**  – Jugadores del mercado con mejor relación puntos/precio: ficha barato y sube el límite.
+    - **steal** – Jugadores de equipos rivales con mejor relación puntos/cláusula: róbalos pagando la cláusula.
+
+    Usa `POST /market/sell` para poner a la venta, `POST /market/bid` para pujar en el mercado
+    y `POST /market/clause/{player_id}` para ejecutar un robo por cláusula.
+    """
+    try:
+        # Datos base en paralelo
+        team_data, market_data, championship_data = await asyncio.gather(
+            client.get_team_players(),
+            client.get_market(),
+            client.get_championship_info(),
+        )
+
+        my_players = _extract_list(team_data)
+        my_ids = {_get_field(p, "_id", "id") for p in my_players if _get_field(p, "_id", "id")}
+        market_players = _extract_list(market_data)
+
+        # Obtener IDs de equipos rivales
+        all_teams = _extract_list(championship_data)
+        rival_ids = [
+            tid for t in all_teams
+            if (tid := _get_field(t, "_id", "id", "userteamId")) and tid != client.user_team_id
+        ][:max_teams]
+
+        # Rosters rivales en paralelo (ignorar errores individuales)
+        rival_results = await asyncio.gather(
+            *[client.get_team_players(team_id=tid) for tid in rival_ids],
+            return_exceptions=True,
+        )
+
+        steal_candidates: list[dict] = []
+        for res in rival_results:
+            if isinstance(res, Exception):
+                continue
+            for p in _extract_list(res):
+                pid = _get_field(p, "_id", "id")
+                if pid and pid not in my_ids:
+                    steal_candidates.append(p)
+
+        # Ordenar y recortar
+        sell = sorted(my_players, key=lambda p: _efficiency(p, "value"))[:top]
+        buy = sorted(market_players, key=lambda p: _efficiency(p, "price"), reverse=True)[:top]
+        steal = sorted(steal_candidates, key=lambda p: _efficiency(p, "clause"), reverse=True)[:top]
+
+        return {
+            "summary": {
+                "my_players": len(my_players),
+                "market_players": len(market_players),
+                "rival_players_scanned": len(steal_candidates),
+            },
+            "sell": [_player_summary(p, "sell") for p in sell],
+            "buy": [_player_summary(p, "buy") for p in buy],
+            "steal": [_player_summary(p, "steal") for p in steal],
+        }
     except Exception as exc:
         _handle_error(exc)
 

@@ -212,6 +212,10 @@ class FutmondoClient:
         """Obtiene la sala de prensa (noticias del equipo)."""
         return await self._post("PRESSROOM")
 
+    async def get_user_info(self) -> dict:
+        """Obtiene información del usuario: saldo, límite salarial y estado financiero."""
+        return await self._post("USER_INFORMATION")
+
     async def close(self):
         """Cierra el cliente HTTP."""
         await self.client.aclose()
