@@ -1098,6 +1098,7 @@ async def health():
 LALIGA_TOTAL_JORNADAS = 38
 STARTING_BUDGET       = 200_000_000
 MONEY_PER_POINT       = 150_000
+TARGET_PTS_JORNADA    = 180
 
 
 # ── Rivals intelligence ────────────────────────────────────────────────────────
@@ -1374,6 +1375,278 @@ def _steal_risk(player: dict) -> str:
     if clause_val < 100_000_000:
         return "MEDIO"
     return "BAJO"
+
+
+@app.get("/warroom", tags=["Guerra"])
+async def war_room(
+    max_clause_gk:  float = Query(150_000_000, description="Cláusula máxima para robar portero rival"),
+    max_clause_any: float = Query(300_000_000, description="Cláusula máxima para robar cualquier jugador"),
+    min_avg:        float = Query(7.0,          description="Media mínima de objetivos"),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **War Room — sala de guerra completa.**
+
+    Combina en una sola llamada:
+    1. **Estado del roster** propio (huecos disponibles, en venta, jugadores activos)
+    2. **Caza de porteros**: rivales con 1 solo portero y cláusula asequible → robar = -5 pts garantizados
+    3. **Rivales confiados**: sin conectar > 12h → no reaccionarán al robo
+    4. **Top objetivos**: mejores jugadores robables ordenados por avg
+    5. **Plan de ataque**: prioridad = (confiado + único portero + avg alta) / cláusula
+    6. **Defensa propia**: nuestros jugadores más vulnerables
+
+    Objetivo: **{TARGET_PTS_JORNADA} pts/jornada**.
+    """.format(TARGET_PTS_JORNADA=TARGET_PTS_JORNADA)
+    now = datetime.now(timezone.utc)
+
+    # ── Datos propios ──────────────────────────────────────────────────────────
+    my_raw = await client.get_team_players()
+    my_players = _extract_list(my_raw)
+    roster_size   = len(my_players)
+    on_market_cnt = sum(1 for p in my_players if p.get("market"))
+    active_cnt    = roster_size - on_market_cnt
+    free_slots    = max(0, 12 - roster_size)
+    xi            = _best_lineup_analysis(my_players, TARGET_PTS_JORNADA)
+
+    # ── Datos rivales ──────────────────────────────────────────────────────────
+    champ_raw = await client.get_championship_info()
+    inner     = champ_raw.get("answer", champ_raw) if isinstance(champ_raw, dict) else {}
+    champ_teams = inner.get("teams", []) if isinstance(inner, dict) else []
+    my_id = client.user_team_id
+
+    rival_teams = [t for t in champ_teams if (t.get("teamid") or t.get("id")) != my_id]
+
+    async def fetch(t):
+        tid = t.get("teamid") or t.get("id")
+        try:
+            raw = await client.get_team_players(team_id=tid)
+            return t, _extract_list(raw)
+        except Exception:
+            return t, []
+
+    all_rosters = await asyncio.gather(*[fetch(t) for t in rival_teams])
+
+    my_ids = {_get_field(p, "_id", "id") for p in my_players}
+
+    gk_targets  = []   # porteros robables de equipos con 1 solo GK
+    top_targets = []   # mejores jugadores por avg
+    team_intel  = []   # perfil de cada rival
+
+    for team_info, roster in all_rosters:
+        tid       = team_info.get("teamid") or team_info.get("id")
+        team_name = team_info.get("teamname") or team_info.get("name", "?")
+        pts       = float(team_info.get("points") or 0)
+        last_acc  = team_info.get("lastAccess") or ""
+        hours_offline = None
+        if last_acc:
+            try:
+                la = datetime.fromisoformat(last_acc.replace("Z", "+00:00"))
+                hours_offline = (now - la).total_seconds() / 3600
+            except Exception:
+                pass
+
+        confiado = (hours_offline or 0) > 12
+
+        gks = [p for p in roster if p.get("role", "").lower() == "portero"]
+        only_one_gk = len(gks) == 1
+
+        team_intel.append({
+            "team": team_name, "points": pts,
+            "roster_size": len(roster), "gk_count": len(gks),
+            "hours_offline": round(hours_offline, 1) if hours_offline else 0,
+            "confiado": confiado,
+        })
+
+        for p in roster:
+            pid     = _get_field(p, "_id", "id")
+            if pid in my_ids:
+                continue
+            avg     = _avg_per_game(p)
+            c_price = _clause_price(p)
+            cl      = p.get("clause") or {}
+            transferred = cl.get("transferred", False) if isinstance(cl, dict) else False
+            c_hours = _clause_hours_left(p)
+            if transferred or c_price <= 0 or (c_hours is not None and c_hours <= 0):
+                continue
+
+            role = p.get("role", "").lower()
+            is_gk = role == "portero"
+
+            # Portero único → robo = -5 garantizados
+            if is_gk and only_one_gk and c_price <= max_clause_gk:
+                gk_targets.append({
+                    "name": p.get("name"), "role": "portero",
+                    "team": team_name, "team_id": tid,
+                    "avg_per_game": round(avg, 2),
+                    "clause_price": int(c_price),
+                    "clause_hours_left": round(c_hours, 1) if c_hours else None,
+                    "team_confiado": confiado,
+                    "team_offline_h": round(hours_offline, 1) if hours_offline else 0,
+                    "damage": "RIVAL SIN PORTERO → -5 pts + XI roto",
+                    "priority": round((10 + (20 if confiado else 0)) / (c_price / 1e6), 4),
+                    "id": pid, "slug": p.get("slug"),
+                })
+
+            # Mejores jugadores generales
+            if avg >= min_avg and c_price <= max_clause_any:
+                last5 = float((p.get("average") or {}).get("averageLastFive") or avg)
+                top_targets.append({
+                    "name": p.get("name"), "role": role,
+                    "team": team_name, "team_id": tid,
+                    "avg_per_game": round(avg, 2),
+                    "last5_avg": round(last5, 2),
+                    "clause_price": int(c_price),
+                    "clause_hours_left": round(c_hours, 1) if c_hours else None,
+                    "team_confiado": confiado,
+                    "team_offline_h": round(hours_offline, 1) if hours_offline else 0,
+                    "id": pid, "slug": p.get("slug"),
+                })
+
+    gk_targets.sort(key=lambda x: (-x["team_offline_h"], x["clause_price"]))
+    top_targets.sort(key=lambda x: (-x["avg_per_game"], x["clause_price"]))
+
+    # ── Defensa propia ─────────────────────────────────────────────────────────
+    my_risks = []
+    for p in my_players:
+        c_price = _clause_price(p)
+        c_hours = _clause_hours_left(p)
+        if c_price > 0 and c_hours and c_hours > 0:
+            my_risks.append({
+                "name": p.get("name"), "role": p.get("role"),
+                "avg_per_game": _avg_per_game(p),
+                "clause_price": int(c_price),
+                "hours_until_expiry": round(c_hours, 1),
+                "risk": _steal_risk(p),
+                "on_market": bool(p.get("market")),
+            })
+    my_risks.sort(key=lambda x: x["clause_price"])
+
+    return {
+        "target_pts_jornada": TARGET_PTS_JORNADA,
+        "roster": {
+            "total": roster_size, "active": active_cnt,
+            "on_market": on_market_cnt, "free_slots": free_slots,
+        },
+        "xi": {
+            "formation": xi.get("formation"),
+            "projected_pts_jornada": xi.get("projected_pts_jornada"),
+            "gap_to_target": round(TARGET_PTS_JORNADA - xi.get("projected_pts_jornada", 0), 1),
+        },
+        "attack": {
+            "gk_hunter":    gk_targets[:8],
+            "top_targets":  top_targets[:10],
+        },
+        "defense": {
+            "our_risks": my_risks,
+        },
+        "rival_intel": sorted(team_intel, key=lambda x: -x["hours_offline"]),
+    }
+
+
+@app.post("/warroom/retaliate", tags=["Guerra"])
+async def retaliate(
+    stolen_player_name: str = Query(..., description="Nombre del jugador que nos robaron"),
+    max_clause: float = Query(200_000_000, description="Máximo a pagar en represalia"),
+    prefer_gk:  bool  = Query(True, description="Priorizar robar el portero del rival (máximo daño)"),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Retaliación automática — responde a un robo con otro robo.**
+
+    Si un rival nos roba un jugador, este endpoint:
+    1. Identifica qué equipo robó al jugador (buscando quién lo tiene ahora)
+    2. Encuentra su jugador más valioso con cláusula accesible
+    3. Si `prefer_gk=true` y tienen 1 solo portero → roba el portero (daño máximo)
+    4. Ejecuta el robo inmediatamente
+
+    Robar = rival pierde jugador + -5 pts en la siguiente jornada.
+    """
+    # Buscar quién tiene ahora el jugador robado
+    champ_raw   = await client.get_championship_info()
+    inner       = champ_raw.get("answer", champ_raw) if isinstance(champ_raw, dict) else {}
+    champ_teams = inner.get("teams", []) if isinstance(inner, dict) else []
+    my_id       = client.user_team_id
+    rival_teams = [t for t in champ_teams if (t.get("teamid") or t.get("id")) != my_id]
+
+    async def fetch(t):
+        tid = t.get("teamid") or t.get("id")
+        try:
+            raw = await client.get_team_players(team_id=tid)
+            return t, _extract_list(raw)
+        except Exception:
+            return t, []
+
+    all_rosters = await asyncio.gather(*[fetch(t) for t in rival_teams])
+
+    thief_team  = None
+    thief_roster = []
+    for team_info, roster in all_rosters:
+        for p in roster:
+            if stolen_player_name.lower() in (p.get("name") or "").lower():
+                thief_team   = team_info
+                thief_roster = roster
+                break
+        if thief_team:
+            break
+
+    if not thief_team:
+        return {"status": "not_found", "message": f"No se encontró a '{stolen_player_name}' en ningún equipo rival"}
+
+    team_name = thief_team.get("teamname") or thief_team.get("name", "?")
+    gks = [p for p in thief_roster if p.get("role", "").lower() == "portero"]
+
+    # Elegir objetivo de represalia
+    target_player = None
+
+    if prefer_gk and len(gks) == 1:
+        gk = gks[0]
+        cp = _clause_price(gk)
+        if 0 < cp <= max_clause:
+            target_player = gk
+
+    if not target_player:
+        # Mejor jugador por avg con cláusula accesible
+        candidates = [
+            p for p in thief_roster
+            if 0 < _clause_price(p) <= max_clause
+            and not (p.get("clause") or {}).get("transferred", False)
+        ]
+        candidates.sort(key=lambda p: _avg_per_game(p), reverse=True)
+        target_player = candidates[0] if candidates else None
+
+    if not target_player:
+        return {
+            "status": "no_target",
+            "thief": team_name,
+            "message": "No hay jugadores robables con cláusula accesible en ese equipo",
+        }
+
+    pid    = _get_field(target_player, "_id", "id")
+    slug   = target_player.get("slug")
+    price  = int(_clause_price(target_player))
+    name   = target_player.get("name")
+
+    resp = await client.pay_player_clause(pid, str(slug), price)
+    ans  = resp.get("answer", {}) if isinstance(resp, dict) else {}
+    if isinstance(ans, dict) and ans.get("error"):
+        return {
+            "status":  "error",
+            "thief":   team_name,
+            "target":  name,
+            "error":   ans.get("code"),
+            "clause":  price,
+        }
+
+    return {
+        "status":         "retaliated",
+        "thief_team":     team_name,
+        "stolen_from_us": stolen_player_name,
+        "we_stole":       name,
+        "role":           target_player.get("role"),
+        "avg_per_game":   _avg_per_game(target_player),
+        "clause_paid":    price,
+        "damage":         "¡PORTERO ROBADO — RIVAL SIN GK → -5 pts!" if target_player.get("role","").lower() == "portero" else f"Robado {name} avg={_avg_per_game(target_player):.2f}/j",
+    }
 
 
 @app.get("/defense", tags=["Estrategia"])
