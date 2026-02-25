@@ -25,7 +25,7 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -1437,6 +1437,152 @@ async def snipe_player(body: SnipeRequest, client: FutmondoClient = Depends(get_
         "previous_best": int(best_bid),
         "waited_seconds": int(wait_seconds),
         "expiry":        expiry.isoformat(),
+    }
+
+
+# ── Clause sniper ──────────────────────────────────────────────────────────────
+
+class ClauseSniperRequest(BaseModel):
+    player_id:     str       = Field(..., description="ID del jugador (campo '_id' del roster rival)")
+    player_slug:   str       = Field(..., description="Slug del jugador")
+    clause_price:  int       = Field(..., gt=0, description="Precio exacto de la cláusula")
+    team_id:       str | None = Field(None, description="ID del equipo rival para localizar al jugador más rápido")
+    snipe_seconds: int       = Field(10, ge=3, le=120,
+                                     description="Segundos antes de que expire la cláusula en que disparamos (default 10)")
+    max_wait:      int       = Field(300, ge=5, le=3600,
+                                     description="Máximo de segundos que este endpoint esperará antes de disparar. "
+                                                 "Si la cláusula expira más tarde, devuelve 'too_early' con el tiempo restante.")
+    dry_run:       bool      = Field(False, description="Si True planifica pero NO paga la cláusula")
+
+
+@app.post("/market/clause-snipe", tags=["Inteligencia"])
+async def clause_snipe(body: ClauseSniperRequest, client: FutmondoClient = Depends(get_client)):
+    """
+    **Sniper de cláusulas — roba en el último segundo antes de que expire.**
+
+    Cuando una cláusula rival está a punto de caducar el rival ya no tiene tiempo
+    de renovarla ni de reaccionar. Este endpoint espera hasta `snipe_seconds`
+    antes de la expiración y dispara `pay_player_clause` en ese instante.
+
+    **Flujo:**
+    1. Obtiene la fecha de expiración de la cláusula del jugador.
+    2. Calcula cuántos segundos faltan y espera hasta el momento exacto.
+    3. Si faltan más segundos que `max_wait` devuelve `too_early` con el tiempo
+       restante para que puedas relanzar el endpoint en el momento adecuado.
+    4. Dispara la cláusula en el instante preciso.
+
+    **Tip:** lanza este endpoint cuando queden `max_wait` + unos segundos de margen.
+    Con `max_wait=300` (default) puedes llamarlo hasta 5 min antes y espera solo.
+    """
+    now = datetime.now(timezone.utc)
+
+    # ── 1. Localizar al jugador y obtener la expiry de su cláusula ────────────
+    expiry: datetime | None = None
+    player_name: str = body.player_id  # fallback
+
+    # Primero intento con get_player_data (más rápido, no requiere team_id)
+    try:
+        pdata = await client.get_player_data(body.player_id)
+        candidate = pdata
+        # La respuesta puede venir envuelta en 'answer'
+        if isinstance(pdata, dict) and "answer" in pdata:
+            ans = pdata["answer"]
+            candidate = ans if isinstance(ans, dict) else pdata
+        expiry = _clause_expiry(candidate)
+        player_name = candidate.get("name") or body.player_id
+    except Exception:
+        pass
+
+    # Si no tenemos expiry, buscar en el roster del equipo rival
+    if expiry is None and body.team_id:
+        try:
+            roster_raw = await client.get_team_players(team_id=body.team_id)
+            for p in _extract_list(roster_raw):
+                if _get_field(p, "_id", "id") == body.player_id or str(p.get("slug")) == body.player_slug:
+                    expiry = _clause_expiry(p)
+                    player_name = p.get("name") or body.player_id
+                    break
+        except Exception:
+            pass
+
+    if expiry is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "No se pudo obtener la fecha de expiración de la cláusula. "
+                "Proporciona 'team_id' para buscar en el roster del equipo rival."
+            ),
+        )
+
+    seconds_left = (expiry - now).total_seconds()
+
+    if seconds_left <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"La cláusula de {player_name} ya ha expirado.",
+        )
+
+    # ── 2. Calcular tiempo de espera ──────────────────────────────────────────
+    # Queremos disparar cuando queden exactamente snipe_seconds
+    wait_seconds = max(0.0, seconds_left - body.snipe_seconds)
+
+    if wait_seconds > body.max_wait:
+        return {
+            "status":              "too_early",
+            "player":              player_name,
+            "clause_price":        body.clause_price,
+            "clause_expires":      expiry.isoformat(),
+            "seconds_until_expiry": round(seconds_left, 1),
+            "seconds_until_fire":  round(wait_seconds, 1),
+            "snipe_at":            (expiry - timedelta(seconds=body.snipe_seconds)).isoformat(),
+            "message": (
+                f"Cláusula expira en {seconds_left / 3600:.1f}h. "
+                f"Relanza este endpoint en {wait_seconds - body.max_wait:.0f}s "
+                f"(o cuando queden ~{body.max_wait}s para la expiración)."
+            ),
+        }
+
+    if body.dry_run:
+        return {
+            "status":             "plan",
+            "dry_run":            True,
+            "player":             player_name,
+            "clause_price":       body.clause_price,
+            "clause_expires":     expiry.isoformat(),
+            "seconds_until_fire": round(wait_seconds, 1),
+            "snipe_at":           (expiry - timedelta(seconds=body.snipe_seconds)).isoformat(),
+            "message":            f"Dispararía en {wait_seconds:.0f}s (dry_run activado — no se ejecutará).",
+        }
+
+    # ── 3. Esperar hasta el momento exacto ────────────────────────────────────
+    if wait_seconds > 0:
+        await asyncio.sleep(wait_seconds)
+
+    # ── 4. Disparar la cláusula ───────────────────────────────────────────────
+    try:
+        resp = await client.pay_player_clause(body.player_id, body.player_slug, body.clause_price)
+    except Exception as exc:
+        _handle_error(exc)
+
+    ans = resp.get("answer", {}) if isinstance(resp, dict) else {}
+    if isinstance(ans, dict) and ans.get("error"):
+        return {
+            "status":          "error",
+            "player":          player_name,
+            "error":           ans.get("code", "unknown"),
+            "clause_price":    body.clause_price,
+            "waited_seconds":  round(wait_seconds, 1),
+            "fired_at":        datetime.now(timezone.utc).isoformat(),
+        }
+
+    return {
+        "status":          "stolen",
+        "player":          player_name,
+        "clause_paid":     body.clause_price,
+        "waited_seconds":  round(wait_seconds, 1),
+        "fired_at":        datetime.now(timezone.utc).isoformat(),
+        "clause_expired":  expiry.isoformat(),
+        "seconds_before_expiry": round(body.snipe_seconds, 1),
     }
 
 
@@ -2908,10 +3054,11 @@ def _write_fichajes(data: list[dict]) -> None:
 
 
 class FichajeItem(BaseModel):
-    player_id:   str   = Field(..., description="ID del jugador (campo '_id' del roster rival)")
-    player_slug: str   = Field(..., description="Slug del jugador")
-    price:       int   = Field(..., gt=0, description="Precio exacto de la cláusula")
-    name:        str   = Field("",  description="Nombre descriptivo (opcional)")
+    player_id:   str       = Field(..., description="ID del jugador (campo '_id' del roster rival)")
+    player_slug: str       = Field(..., description="Slug del jugador")
+    price:       int       = Field(..., gt=0, description="Precio exacto de la cláusula")
+    name:        str       = Field("",  description="Nombre descriptivo (opcional)")
+    team_id:     str | None = Field(None, description="ID del equipo rival (necesario para snipe_mode)")
 
 
 @app.get("/market/fichajes", tags=["Fichajes"])
@@ -2956,6 +3103,33 @@ async def clear_fichajes():
     return {"status": "cleared"}
 
 
+async def _fire_one_clause(
+    client: FutmondoClient,
+    pid: str,
+    slug: str,
+    price: int,
+    retries: int,
+    sleep_ms: int,
+) -> tuple[bool, str | None]:
+    """Dispara una cláusula con reintentos. Devuelve (ok, error_code)."""
+    last_err: str | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = await client.pay_player_clause(pid, slug, price)
+            ans  = resp.get("answer", {}) if isinstance(resp, dict) else {}
+            if isinstance(ans, dict) and not ans.get("error"):
+                return True, None
+            err = ans.get("code", "unknown") if isinstance(ans, dict) else "unknown"
+            last_err = err
+            if err in ("api.market.max_number_players_in_roster", "api.error.not_found"):
+                return False, err  # error fatal, no reintentar
+        except Exception as exc:
+            last_err = str(exc)
+        if attempt < retries:
+            await asyncio.sleep(sleep_ms / 1000)
+    return False, last_err
+
+
 @app.post("/market/fichajes/fire", tags=["Fichajes"])
 async def fire_fichajes(
     retries: int = Query(20, ge=1, le=50,
@@ -2964,77 +3138,144 @@ async def fire_fichajes(
         description="Milisegundos entre intentos (default 200 ms)"),
     clear_on_success: bool = Query(True,
         description="Eliminar de la lista los jugadores fichados con éxito"),
+    snipe_mode: bool = Query(False,
+        description=(
+            "Si True espera hasta los últimos `snipe_seconds` de cada cláusula antes de disparar. "
+            "Requiere que cada item de la lista tenga `team_id` para obtener la fecha de expiración."
+        )),
+    snipe_seconds: int = Query(10, ge=3, le=120,
+        description="En snipe_mode: segundos antes de la expiración en que disparamos (default 10)"),
     client: FutmondoClient = Depends(get_client),
 ):
     """
     **Dispara los fichajes de la lista de espera** con reintentos rápidos.
 
-    Patrón de medianoche (idéntico al Telegram bot):
+    **Modo estándar** (`snipe_mode=false`):
     - Ejecuta cada cláusula `retries` veces con `sleep_ms` ms entre intentos.
-    - Se detiene en el primer éxito para cada jugador.
     - Ideal para lanzar justo a las 00:00 cuando Futmondo renueva las cláusulas.
 
+    **Modo sniper** (`snipe_mode=true`):
+    - Para cada jugador calcula cuándo expira su cláusula.
+    - Espera hasta `snipe_seconds` antes de la expiración y entonces dispara.
+    - Todos los jugadores se procesan **en paralelo**: cada uno espera de forma
+      independiente y se lanza en su propio momento óptimo.
+    - El rival no tiene tiempo de renovar ni de reaccionar.
+    - Requiere que cada item de la lista tenga `team_id`.
+
     ```
-    POST /market/fichajes/fire?retries=20&sleep_ms=200
+    POST /market/fichajes/fire?snipe_mode=true&snipe_seconds=10
     ```
     """
     fichajes = _read_fichajes()
     if not fichajes:
         return {"status": "empty", "results": []}
 
-    results = []
-    signed_ids = []
+    if snipe_mode:
+        # ── Modo sniper: procesar todos en paralelo, cada uno en su momento ──
+        async def _snipe_one(item: dict) -> dict:
+            pid   = item["player_id"]
+            slug  = item["player_slug"]
+            price = item["price"]
+            name  = item.get("name", pid)
+            tid   = item.get("team_id")
 
-    for item in fichajes:
-        pid   = item["player_id"]
-        slug  = item["player_slug"]
-        price = item["price"]
-        name  = item.get("name", pid)
+            result: dict = {
+                "name": name, "player_id": pid, "price": price,
+                "mode": "snipe", "waited_seconds": 0,
+                "attempts": 0, "status": "not_tried", "error": None,
+            }
 
-        result = {"name": name, "player_id": pid, "price": price,
-                  "attempts": 0, "status": "not_tried", "error": None}
-
-        for attempt in range(1, retries + 1):
-            result["attempts"] = attempt
+            # Obtener expiración de la cláusula
+            expiry: datetime | None = None
             try:
-                resp = await client.pay_player_clause(pid, slug, price)
-                ans  = resp.get("answer", {}) if isinstance(resp, dict) else {}
-                if isinstance(ans, dict) and not ans.get("error"):
-                    result["status"] = "ok"
-                    signed_ids.append(pid)
-                    break
-                else:
-                    err = ans.get("code", "unknown") if isinstance(ans, dict) else "unknown"
-                    result["error"] = err
-                    # Errores fatales: no reintentar
-                    if err in ("api.market.max_number_players_in_roster",
-                               "api.error.not_found"):
-                        result["status"] = "fatal_error"
-                        break
-                    result["status"] = "retrying"
-            except Exception as exc:
-                result["error"] = str(exc)
-                result["status"] = "exception"
+                pdata = await client.get_player_data(pid)
+                candidate = pdata
+                if isinstance(pdata, dict) and "answer" in pdata:
+                    ans = pdata["answer"]
+                    candidate = ans if isinstance(ans, dict) else pdata
+                expiry = _clause_expiry(candidate)
+            except Exception:
+                pass
 
-            if attempt < retries:
-                await asyncio.sleep(sleep_ms / 1000)
+            if expiry is None and tid:
+                try:
+                    roster_raw = await client.get_team_players(team_id=tid)
+                    for p in _extract_list(roster_raw):
+                        if _get_field(p, "_id", "id") == pid or str(p.get("slug")) == slug:
+                            expiry = _clause_expiry(p)
+                            break
+                except Exception:
+                    pass
 
-        if result["status"] == "retrying":
-            result["status"] = "exhausted"
+            if expiry is None:
+                result["status"] = "no_expiry"
+                result["error"]  = "No se pudo obtener la fecha de expiración (añade team_id al item)"
+                return result
 
-        results.append(result)
+            now          = datetime.now(timezone.utc)
+            seconds_left = (expiry - now).total_seconds()
+
+            if seconds_left <= 0:
+                result["status"] = "expired"
+                result["error"]  = "La cláusula ya ha expirado"
+                return result
+
+            wait = max(0.0, seconds_left - snipe_seconds)
+            result["waited_seconds"]   = round(wait, 1)
+            result["clause_expires"]   = expiry.isoformat()
+            result["snipe_at"]         = (expiry - timedelta(seconds=snipe_seconds)).isoformat()
+
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+            ok, err = await _fire_one_clause(client, pid, slug, price, retries, sleep_ms)
+            result["attempts"] = retries if not ok else 1
+            if ok:
+                result["status"] = "ok"
+            else:
+                result["status"] = "error"
+                result["error"]  = err
+            return result
+
+        results_raw = await asyncio.gather(*[_snipe_one(item) for item in fichajes])
+        results = list(results_raw)
+
+    else:
+        # ── Modo estándar: disparar uno a uno con reintentos ──────────────────
+        results    = []
+        for item in fichajes:
+            pid   = item["player_id"]
+            slug  = item["player_slug"]
+            price = item["price"]
+            name  = item.get("name", pid)
+
+            result: dict = {
+                "name": name, "player_id": pid, "price": price,
+                "mode": "standard", "attempts": 0, "status": "not_tried", "error": None,
+            }
+            ok, err = await _fire_one_clause(client, pid, slug, price, retries, sleep_ms)
+            result["attempts"] = retries if not ok else 1
+            if ok:
+                result["status"] = "ok"
+            else:
+                result["status"] = "exhausted" if err not in ("api.market.max_number_players_in_roster", "api.error.not_found") else "fatal_error"
+                result["error"]  = err
+            results.append(result)
 
     # Limpiar la lista de los fichados con éxito
+    signed_ids = [r["player_id"] for r in results if r["status"] == "ok"]
     if clear_on_success and signed_ids:
         remaining = [c for c in fichajes if c["player_id"] not in signed_ids]
         _write_fichajes(remaining)
 
-    ok_count  = sum(1 for r in results if r["status"] == "ok")
+    ok_count = sum(1 for r in results if r["status"] == "ok")
     return {
-        "fired":         len(fichajes),
-        "signed":        ok_count,
-        "failed":        len(fichajes) - ok_count,
-        "retries_used":  retries,
-        "sleep_ms":      sleep_ms,
-        "results":       results,
+        "mode":         "snipe" if snipe_mode else "standard",
+        "snipe_seconds": snipe_seconds if snipe_mode else None,
+        "fired":        len(fichajes),
+        "signed":       ok_count,
+        "failed":       len(fichajes) - ok_count,
+        "retries_used": retries,
+        "sleep_ms":     sleep_ms,
+        "results":      results,
     }
