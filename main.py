@@ -56,12 +56,27 @@ _client: FutmondoClient | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _client
+    global _client, _autogestione_task
     try:
         _client = FutmondoClient()
     except ValueError as exc:
         raise RuntimeError(f"Error de configuración: {exc}") from exc
+
+    # Auto-arrancar la autogestión si la config persistida dice enabled=True
+    saved_cfg = _ag_load_config()
+    if saved_cfg.enabled and _client:
+        _autogestione_task = asyncio.create_task(_autogestione_loop(_client, saved_cfg))
+
     yield
+
+    # Apagar la autogestión limpiamente
+    if _autogestione_task and not _autogestione_task.done():
+        _autogestione_task.cancel()
+        try:
+            await _autogestione_task
+        except asyncio.CancelledError:
+            pass
+
     if _client:
         await _client.close()
 
@@ -3278,4 +3293,509 @@ async def fire_fichajes(
         "retries_used": retries,
         "sleep_ms":     sleep_ms,
         "results":      results,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTOGESTIÓN — agente autónomo de gestión continua del equipo
+# ══════════════════════════════════════════════════════════════════════════════
+
+_AUTOGESTIONE_CONFIG_FILE = Path(__file__).parent / "autogestione.json"
+_autogestione_task: asyncio.Task | None = None
+_autogestione_log:  list[dict]          = []   # ring buffer de los últimos eventos
+_MAX_LOG             = 500
+
+
+class AutoGestioneConfig(BaseModel):
+    enabled:               bool  = Field(False,  description="Activar/desactivar (persiste en disco)")
+    check_interval_minutes: int  = Field(30, ge=1, le=1440, description="Minutos entre ciclos completos")
+    # ── Ventas ──────────────────────────────────────────────────────────────
+    auto_sell:         bool  = Field(True,  description="Vender los peores jugadores automáticamente")
+    sell_bottom_pct:   float = Field(0.20, ge=0.0, le=1.0, description="% inferior de la plantilla a vender por ciclo")
+    sell_min_avg:      float = Field(6.0,  ge=0.0, description="Proteger jugadores con avg ≥ este valor (0 = sin protección)")
+    sell_price_markup: float = Field(0.10, ge=0.0, le=0.5, description="Markup sobre valor al poner en venta")
+    # ── Robos por cláusula ─────────────────────────────────────────────────
+    auto_attack:      bool  = Field(True,  description="Robar jugadores rivales automáticamente")
+    steal_top:        int   = Field(2, ge=0, le=5, description="Máximo de robos por ciclo")
+    steal_min_avg:    float = Field(7.0,  ge=0.0, description="Media mínima del objetivo para robar")
+    steal_max_clause: float = Field(0.0,  ge=0.0, description="Cláusula máxima a pagar (0 = sin límite)")
+    prefer_gk:        bool  = Field(True,  description="Priorizar portero único rival (máximo daño)")
+    # ── Mercado ────────────────────────────────────────────────────────────
+    cancel_expiring:      bool  = Field(True,  description="Cancelar listings que expiran sin puja")
+    cancel_hours:         float = Field(3.0, ge=0.5, le=24.0, description="Horas de margen para cancelar sin puja")
+    auto_reprice:         bool  = Field(False, description="Re-preciar listings activos cada ciclo")
+    reprice_markup:       float = Field(0.10, ge=0.0, le=0.5, description="Markup para repreciar listings")
+    # ── Sniper de fichajes ─────────────────────────────────────────────────
+    auto_snipe:      bool = Field(True,  description="Disparar la lista de fichajes en el último segundo")
+    snipe_seconds:   int  = Field(10,  ge=3, le=120, description="Segundos antes de expirar en que se dispara")
+    snipe_retries:   int  = Field(5,   ge=1, le=20,  description="Reintentos tras el disparo del snipe")
+
+
+# ── Persistencia de config ─────────────────────────────────────────────────────
+
+def _ag_load_config() -> AutoGestioneConfig:
+    if _AUTOGESTIONE_CONFIG_FILE.exists():
+        try:
+            return AutoGestioneConfig(**json.loads(_AUTOGESTIONE_CONFIG_FILE.read_text()))
+        except Exception:
+            pass
+    return AutoGestioneConfig()
+
+
+def _ag_save_config(cfg: AutoGestioneConfig) -> None:
+    _AUTOGESTIONE_CONFIG_FILE.write_text(cfg.model_dump_json(indent=2))
+
+
+# ── Log ───────────────────────────────────────────────────────────────────────
+
+def _ag_log(action: str, detail: str, status: str = "info", data: dict | None = None) -> None:
+    global _autogestione_log
+    entry: dict = {
+        "ts":     datetime.now(timezone.utc).isoformat(),
+        "action": action,
+        "detail": detail,
+        "status": status,
+    }
+    if data:
+        entry["data"] = data
+    _autogestione_log.append(entry)
+    if len(_autogestione_log) > _MAX_LOG:
+        _autogestione_log = _autogestione_log[-_MAX_LOG:]
+
+
+# ── Lógica de un ciclo completo ───────────────────────────────────────────────
+
+async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
+    _ag_log("cycle_start", f"Ciclo iniciado — intervalo {cfg.check_interval_minutes} min")
+
+    # ── 1. Cancelar listings expirados sin puja ───────────────────────────────
+    if cfg.cancel_expiring:
+        try:
+            raw    = await client.get_my_players_in_market()
+            listed = _extract_list(raw)
+            for s in [_listing_status(p, 0.0) for p in listed]:
+                if s["num_bids"] == 0 and s["hours_left"] is not None and s["hours_left"] < cfg.cancel_hours:
+                    pid = s["_id"]
+                    if pid:
+                        try:
+                            await client.remove_player_from_market(pid)
+                            _ag_log("cancel_listing", f"{s['name']} ({s['hours_left']}h restantes)", "ok")
+                        except Exception as e:
+                            _ag_log("cancel_listing", f"Error con {s['name']}: {e}", "error")
+        except Exception as e:
+            _ag_log("cancel_expiring", f"Error obteniendo listings: {e}", "error")
+
+    # ── 2. Re-preciar listings ────────────────────────────────────────────────
+    if cfg.auto_reprice:
+        try:
+            raw    = await client.get_my_players_in_market()
+            listed = _extract_list(raw)
+            for p in listed:
+                pid       = _get_field(p, "_id", "id")
+                slug      = p.get("slug")
+                value     = float(_get_field(p, "value", "marketValue") or 0)
+                old_price = float(_get_field(p, "price", "sellPrice") or 0)
+                new_price = max(1_000_000, int(value * (1 + cfg.reprice_markup)))
+                if pid and slug and new_price != int(old_price):
+                    try:
+                        await client.remove_player_from_market(pid)
+                        await client.set_player_in_market(pid, str(slug), new_price)
+                        _ag_log("reprice", f"{p.get('name','?')}: {int(old_price):,} → {new_price:,}", "ok")
+                    except Exception as e:
+                        _ag_log("reprice", f"Error con {p.get('name','?')}: {e}", "error")
+        except Exception as e:
+            _ag_log("reprice", f"Error general: {e}", "error")
+
+    # ── 3. Auto-venta ─────────────────────────────────────────────────────────
+    if cfg.auto_sell:
+        try:
+            team_data  = await client.get_team_players()
+            my_players = _extract_list(team_data)
+            active     = [p for p in my_players if not p.get("market")]
+            gk_count   = sum(1 for p in active if p.get("role", "").lower() == "portero")
+
+            sorted_by_eff = sorted(active, key=lambda p: float(p.get("change") or 0))
+            sell_count    = max(1, int(len(sorted_by_eff) * cfg.sell_bottom_pct))
+            candidates    = [
+                p for p in sorted_by_eff
+                if not (p.get("role", "").lower() == "portero" and gk_count <= 1)
+                and (cfg.sell_min_avg == 0 or _avg_per_game(p) < cfg.sell_min_avg)
+            ][:sell_count]
+
+            for p in candidates:
+                pid   = _get_field(p, "_id", "id")
+                slug  = p.get("slug")
+                value = float(_get_field(p, "value", "marketValue") or 0)
+                buy_p = float(p.get("buyPrice") or 0)
+                base  = max(value, buy_p)
+                cap   = int(value * 1.5) if value > 0 else int(base * 1.5)
+                price = min(max(1, int(base * (1 + cfg.sell_price_markup))), cap)
+                # Intentar venta directa primero
+                try:
+                    direct = await client.direct_sell(pid, str(slug))
+                    d_ans  = direct.get("answer", {}) if isinstance(direct, dict) else {}
+                    if isinstance(d_ans, dict) and not d_ans.get("error"):
+                        _ag_log("sell", f"Venta directa: {p.get('name','?')} avg={_avg_per_game(p):.2f}/j", "ok")
+                        continue
+                except Exception:
+                    pass
+                # Fallback: listing en el mercado
+                try:
+                    await client.set_player_in_market(pid, str(slug), price)
+                    _ag_log("sell", f"Mercado: {p.get('name','?')} a {price:,}", "ok")
+                except Exception as e:
+                    _ag_log("sell", f"Error vendiendo {p.get('name','?')}: {e}", "error")
+        except Exception as e:
+            _ag_log("auto_sell", f"Error general: {e}", "error")
+
+    # ── 4. Auto-ataque (robo por cláusula) ────────────────────────────────────
+    if cfg.auto_attack and cfg.steal_top > 0:
+        try:
+            my_raw     = await client.get_team_players()
+            my_players = _extract_list(my_raw)
+            free_slots = max(0, MAX_ROSTER_SIZE - len(my_players))
+
+            if free_slots == 0:
+                _ag_log("auto_attack", "Roster lleno — sin huecos para robar", "skip")
+            else:
+                my_ids     = {_get_field(p, "_id", "id") for p in my_players}
+                champ_raw  = await client.get_championship_info()
+                inner      = champ_raw.get("answer", champ_raw) if isinstance(champ_raw, dict) else {}
+                rival_teams = [
+                    t for t in (inner.get("teams", []) if isinstance(inner, dict) else [])
+                    if (t.get("teamid") or t.get("id")) != client.user_team_id
+                ]
+                now = datetime.now(timezone.utc)
+
+                async def _fetch_r(t):
+                    tid = t.get("teamid") or t.get("id")
+                    try:
+                        return t, _extract_list(await client.get_team_players(team_id=tid))
+                    except Exception:
+                        return t, []
+
+                all_rosters = await asyncio.gather(*[_fetch_r(t) for t in rival_teams])
+
+                steal_pool: list[tuple] = []
+                for team_info, roster in all_rosters:
+                    team_name     = team_info.get("teamname") or team_info.get("name", "?")
+                    last_acc      = team_info.get("lastAccess") or ""
+                    hours_offline = None
+                    if last_acc:
+                        try:
+                            la = datetime.fromisoformat(last_acc.replace("Z", "+00:00"))
+                            hours_offline = (now - la).total_seconds() / 3600
+                        except Exception:
+                            pass
+                    confiado    = (hours_offline or 0) > 12
+                    only_one_gk = sum(1 for p in roster if p.get("role", "").lower() == "portero") == 1
+
+                    for p in roster:
+                        pid = _get_field(p, "_id", "id")
+                        if pid in my_ids:
+                            continue
+                        role        = p.get("role", "").lower()
+                        avg         = _avg_per_game(p)
+                        c_price     = _clause_price(p)
+                        cl          = p.get("clause") or {}
+                        transferred = cl.get("transferred", False) if isinstance(cl, dict) else False
+                        c_hours     = _clause_hours_left(p)
+
+                        if transferred or c_price <= 0 or (c_hours is not None and c_hours <= 0):
+                            continue
+                        if avg < cfg.steal_min_avg:
+                            continue
+                        if cfg.steal_max_clause > 0 and c_price > cfg.steal_max_clause:
+                            continue
+
+                        prio = (1000 if (role == "portero" and only_one_gk and cfg.prefer_gk) else 0)
+                        prio += 200 if confiado else 0
+                        prio += avg * 10
+                        prio -= c_price / 1_000_000
+                        steal_pool.append((prio, pid, p.get("slug"), int(c_price), p.get("name", "?"), role))
+
+                steal_pool.sort(key=lambda x: -x[0])
+                stolen = 0
+                for _, pid, slug, c_price, name, role in steal_pool[:cfg.steal_top]:
+                    if stolen >= free_slots:
+                        break
+                    try:
+                        resp = await client.pay_player_clause(pid, str(slug), c_price)
+                        ans  = resp.get("answer", {}) if isinstance(resp, dict) else {}
+                        if isinstance(ans, dict) and ans.get("error"):
+                            err = ans.get("code", "unknown")
+                            _ag_log("steal", f"Error {name}: {err}", "error")
+                            if err == "api.market.max_number_players_in_roster":
+                                break
+                        else:
+                            _ag_log("steal", f"¡ROBADO! {name} ({role}) por {c_price:,}", "ok",
+                                    {"clause_paid": c_price, "player": name})
+                            stolen += 1
+                    except Exception as e:
+                        _ag_log("steal", f"Excepción con {name}: {e}", "error")
+        except Exception as e:
+            _ag_log("auto_attack", f"Error general: {e}", "error")
+
+    _ag_log("cycle_end", "Ciclo completado")
+
+
+# ── Sniper de fichajes (tarea paralela continua) ───────────────────────────────
+
+async def _execute_snipe_ag(
+    client: FutmondoClient,
+    item: dict,
+    expiry: datetime,
+    cfg: AutoGestioneConfig,
+) -> None:
+    """Espera hasta snipe_seconds antes del vencimiento y dispara la cláusula."""
+    pid   = item["player_id"]
+    slug  = item["player_slug"]
+    price = item["price"]
+    name  = item.get("name", pid)
+
+    wait = max(0.0, (expiry - datetime.now(timezone.utc)).total_seconds() - cfg.snipe_seconds)
+    _ag_log("snipe_scheduled",
+            f"{name} — disparo programado en {wait / 3600:.2f}h "
+            f"({cfg.snipe_seconds}s antes de la expiración)",
+            "info", {"snipe_at": (expiry - timedelta(seconds=cfg.snipe_seconds)).isoformat()})
+
+    if wait > 0:
+        try:
+            await asyncio.sleep(wait)
+        except asyncio.CancelledError:
+            _ag_log("snipe_cancelled", f"{name} — cancelado antes de disparar", "warning")
+            return
+
+    ok, err = await _fire_one_clause(client, pid, slug, price, cfg.snipe_retries, 200)
+    if ok:
+        _ag_log("snipe_fired", f"¡ROBADO en el último segundo! {name} por {price:,}", "ok",
+                {"clause_paid": price, "player": name})
+        _write_fichajes([c for c in _read_fichajes() if c["player_id"] != pid])
+    else:
+        _ag_log("snipe_failed", f"Snipe fallido — {name}: {err}", "error")
+
+
+async def _sniper_watcher(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
+    """
+    Tarea paralela que vigila la lista de fichajes y programa un snipe por cada
+    jugador con fecha de expiración de cláusula conocida.
+    Comprueba la lista cada minuto y evita programar el mismo jugador dos veces.
+    """
+    scheduled: dict[str, asyncio.Task] = {}
+
+    while True:
+        try:
+            for item in _read_fichajes():
+                pid = item["player_id"]
+                # Si ya hay una tarea viva para este jugador, saltar
+                if pid in scheduled and not scheduled[pid].done():
+                    continue
+
+                expiry: datetime | None = None
+                try:
+                    pdata     = await client.get_player_data(pid)
+                    candidate = pdata
+                    if isinstance(pdata, dict) and "answer" in pdata:
+                        ans       = pdata["answer"]
+                        candidate = ans if isinstance(ans, dict) else pdata
+                    expiry = _clause_expiry(candidate)
+                except Exception:
+                    pass
+
+                if expiry is None and item.get("team_id"):
+                    try:
+                        roster_raw = await client.get_team_players(team_id=item["team_id"])
+                        for p in _extract_list(roster_raw):
+                            if _get_field(p, "_id", "id") == pid or str(p.get("slug")) == item["player_slug"]:
+                                expiry = _clause_expiry(p)
+                                break
+                    except Exception:
+                        pass
+
+                if expiry:
+                    seconds_left = (expiry - datetime.now(timezone.utc)).total_seconds()
+                    if seconds_left > 0:
+                        task = asyncio.create_task(_execute_snipe_ag(client, item, expiry, cfg))
+                        scheduled[pid] = task
+
+            # Limpiar tareas terminadas
+            for pid in [k for k, v in scheduled.items() if v.done()]:
+                del scheduled[pid]
+
+        except asyncio.CancelledError:
+            for t in scheduled.values():
+                t.cancel()
+            raise
+        except Exception as e:
+            _ag_log("sniper_watcher", f"Error: {e}", "error")
+
+        await asyncio.sleep(60)
+
+
+# ── Loop principal ────────────────────────────────────────────────────────────
+
+async def _autogestione_loop(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
+    _ag_log("started", f"Autogestión activa — ciclo cada {cfg.check_interval_minutes} min")
+
+    sniper_task: asyncio.Task | None = None
+    if cfg.auto_snipe:
+        sniper_task = asyncio.create_task(_sniper_watcher(client, cfg))
+
+    try:
+        while True:
+            await _ag_cycle(client, cfg)
+            cfg = _ag_load_config()          # recarga config en caliente
+            if not cfg.enabled:
+                _ag_log("stopped", "Autogestión desactivada desde configuración")
+                break
+            await asyncio.sleep(cfg.check_interval_minutes * 60)
+    except asyncio.CancelledError:
+        _ag_log("stopped", "Autogestión detenida por señal externa")
+    finally:
+        if sniper_task and not sniper_task.done():
+            sniper_task.cancel()
+            try:
+                await sniper_task
+            except asyncio.CancelledError:
+                pass
+
+
+# ── Endpoints de control ──────────────────────────────────────────────────────
+
+@app.get("/auto/gestione/status", tags=["Automatización"])
+async def autogestione_status():
+    """
+    **Estado actual de la autogestión.**
+
+    Devuelve si el agente está corriendo, la configuración activa,
+    el número de eventos registrados y los últimos 20 del log.
+    """
+    cfg     = _ag_load_config()
+    running = _autogestione_task is not None and not _autogestione_task.done()
+    return {
+        "running":      running,
+        "config":       cfg.model_dump(),
+        "log_entries":  len(_autogestione_log),
+        "recent_log":   _autogestione_log[-20:],
+    }
+
+
+@app.post("/auto/gestione/start", tags=["Automatización"])
+async def autogestione_start(
+    cfg: AutoGestioneConfig | None = None,
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Arranca el agente de autogestión.**
+
+    Acepta opcionalmente un cuerpo `AutoGestioneConfig` para configurar el agente.
+    La configuración se persiste en disco y se recarga automáticamente al reiniciar
+    el servidor si `enabled=true`.
+
+    Si el agente ya está corriendo se reinicia con la nueva configuración.
+    """
+    global _autogestione_task
+
+    active_cfg = cfg or _ag_load_config()
+    active_cfg.enabled = True
+    _ag_save_config(active_cfg)
+
+    if _autogestione_task and not _autogestione_task.done():
+        _autogestione_task.cancel()
+        try:
+            await _autogestione_task
+        except asyncio.CancelledError:
+            pass
+
+    _autogestione_task = asyncio.create_task(_autogestione_loop(client, active_cfg))
+
+    return {
+        "status":  "started",
+        "config":  active_cfg.model_dump(),
+        "message": f"Autogestión iniciada — ciclo cada {active_cfg.check_interval_minutes} min",
+    }
+
+
+@app.post("/auto/gestione/stop", tags=["Automatización"])
+async def autogestione_stop():
+    """
+    **Para el agente de autogestión.**
+
+    Cancela el loop en curso y persiste `enabled=false` para que no
+    se reinicie automáticamente en el próximo arranque del servidor.
+    """
+    global _autogestione_task
+
+    cfg = _ag_load_config()
+    cfg.enabled = False
+    _ag_save_config(cfg)
+
+    if _autogestione_task and not _autogestione_task.done():
+        _autogestione_task.cancel()
+        try:
+            await _autogestione_task
+        except asyncio.CancelledError:
+            pass
+        _autogestione_task = None
+        return {"status": "stopped", "message": "Autogestión detenida"}
+
+    return {"status": "already_stopped", "message": "El agente no estaba corriendo"}
+
+
+@app.patch("/auto/gestione/config", tags=["Automatización"])
+async def autogestione_update_config(
+    cfg: AutoGestioneConfig,
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Actualiza la configuración del agente en caliente.**
+
+    Si el agente está corriendo se reinicia automáticamente con la
+    nueva configuración. Si `enabled` cambia a `false`, se para.
+    Los cambios se persisten en disco.
+    """
+    global _autogestione_task
+
+    _ag_save_config(cfg)
+
+    running = _autogestione_task is not None and not _autogestione_task.done()
+
+    if running:
+        _autogestione_task.cancel()
+        try:
+            await _autogestione_task
+        except asyncio.CancelledError:
+            pass
+        _autogestione_task = None
+
+    if cfg.enabled:
+        _autogestione_task = asyncio.create_task(_autogestione_loop(client, cfg))
+        return {"status": "restarted", "config": cfg.model_dump(),
+                "message": "Configuración aplicada — agente reiniciado"}
+
+    return {"status": "updated", "config": cfg.model_dump(),
+            "message": "Configuración guardada — agente detenido (enabled=false)"}
+
+
+@app.get("/auto/gestione/log", tags=["Automatización"])
+async def autogestione_log_endpoint(
+    last:   int = Query(50,  ge=1,  le=500, description="Últimos N eventos a devolver"),
+    status: str = Query("",         description="Filtrar por status: ok, error, info, skip, warning"),
+    action: str = Query("",         description="Filtrar por acción: cycle_start, steal, sell, snipe_fired…"),
+):
+    """
+    **Log de acciones de la autogestión.**
+
+    Devuelve hasta los últimos `last` eventos del agente, con filtros opcionales
+    por `status` (ok / error / info / skip / warning) y por `action`.
+    """
+    entries = _autogestione_log[-_MAX_LOG:]
+    if status:
+        entries = [e for e in entries if e.get("status") == status]
+    if action:
+        entries = [e for e in entries if e.get("action") == action]
+    return {
+        "total_filtered": len(entries),
+        "shown":          min(last, len(entries)),
+        "log":            entries[-last:],
     }
