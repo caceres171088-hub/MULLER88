@@ -6,3 +6,5 @@ dist/
 build/
 .venv/
 venv/
+fichajes.json
+ultimo-acceso.json
