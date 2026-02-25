@@ -400,6 +400,51 @@ async def get_pressroom(client: FutmondoClient = Depends(get_client)):
         _handle_error(exc)
 
 
+@app.get("/fichajes/hoy", tags=["Fichajes"])
+async def get_fichajes_hoy(client: FutmondoClient = Depends(get_client)):
+    """
+    **Fichajes de hoy** — traspasos registrados en la sala de prensa durante el día de hoy.
+
+    Filtra las noticias del pressroom por la fecha actual (mismo patrón que
+    `getTodayTransfers` del Telegram bot de referencia).
+    """
+    try:
+        raw = await client.get_pressroom()
+    except Exception as exc:
+        _handle_error(exc)
+
+    today = datetime.now(timezone.utc).date().isoformat()  # "YYYY-MM-DD"
+
+    # Extraer lista de noticias de la respuesta
+    news: list = []
+    if isinstance(raw, list):
+        news = raw
+    elif isinstance(raw, dict):
+        ans = raw.get("answer", raw)
+        if isinstance(ans, list):
+            news = ans
+        elif isinstance(ans, dict):
+            for v in ans.values():
+                if isinstance(v, list) and v and isinstance(v[0], dict):
+                    news = v
+                    break
+
+    today_items = []
+    for item in news:
+        item_date = item.get("date") or item.get("createdAt") or item.get("timestamp") or ""
+        if isinstance(item_date, (int, float)):
+            from datetime import datetime as dt_cls
+            item_date = dt_cls.fromtimestamp(item_date / 1000, tz=timezone.utc).date().isoformat()
+        if str(item_date).startswith(today):
+            today_items.append(item)
+
+    return {
+        "date":  today,
+        "total": len(today_items),
+        "items": today_items,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Finanzas
 # ---------------------------------------------------------------------------
@@ -2639,8 +2684,8 @@ async def auto_play(
     active = [p for p in my_players if not p.get("market")]
     gks    = [p for p in active if p.get("role", "").lower() == "portero"]
 
-    # Ordenar por avg_per_game ASC (peores primero)
-    sorted_by_eff = sorted(active, key=lambda p: _avg_per_game(p))
+    # Ordenar por change ASC (mayor bajada de valor primero, como el bot JS getSellablePlayers)
+    sorted_by_eff = sorted(active, key=lambda p: float(p.get("change") or 0))
 
     sell_candidates = []
     for p in sorted_by_eff:
@@ -2667,10 +2712,12 @@ async def auto_play(
         base     = max(value, buy_p)
         max_cap  = int(value * 1.5) if value > 0 else int(base * 1.5)
         price    = min(max(1, int(base * (1 + body.sell_markup))), max_cap)
+        change = int(p.get("change") or 0)
         action = {
             "name":         p.get("name"),
             "role":         p.get("role"),
             "avg_per_game": round(_avg_per_game(p), 2),
+            "change":       change,
             "value":        int(value),
             "buy_price":    int(buy_p),
             "list_price":   price,
@@ -2837,72 +2884,72 @@ async def auto_play(
     }
 
 
-# ── Clausulazos — lista de espera para fichajes automáticos ───────────────────
+# ── Fichajes — lista de espera para fichajes automáticos ─────────────────────
 
-_CLAUSULAZOS_FILE = Path(__file__).parent / "clausulazos.json"
+_FICHAJES_FILE = Path(__file__).parent / "fichajes.json"
 
 
-def _read_clausulazos() -> list[dict]:
-    if _CLAUSULAZOS_FILE.exists():
-        return json.loads(_CLAUSULAZOS_FILE.read_text())
+def _read_fichajes() -> list[dict]:
+    if _FICHAJES_FILE.exists():
+        return json.loads(_FICHAJES_FILE.read_text())
     return []
 
 
-def _write_clausulazos(data: list[dict]) -> None:
-    _CLAUSULAZOS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+def _write_fichajes(data: list[dict]) -> None:
+    _FICHAJES_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 
-class ClausulazoItem(BaseModel):
+class FichajeItem(BaseModel):
     player_id:   str   = Field(..., description="ID del jugador (campo '_id' del roster rival)")
     player_slug: str   = Field(..., description="Slug del jugador")
     price:       int   = Field(..., gt=0, description="Precio exacto de la cláusula")
     name:        str   = Field("",  description="Nombre descriptivo (opcional)")
 
 
-@app.get("/market/clausulazos", tags=["Clausulazos"])
-async def list_clausulazos():
+@app.get("/market/fichajes", tags=["Fichajes"])
+async def list_fichajes():
     """
     **Lista de espera de fichajes** — jugadores que se intentarán fichar por cláusula
-    en el próximo disparo (`POST /market/clausulazos/fire`).
+    en el próximo disparo (`POST /market/fichajes/fire`).
 
     El patrón recomendado (inspirado en bots de alta frecuencia) es ejecutar
     `/fire` con `retries=20` justo a medianoche, cuando Futmondo renueva las cláusulas.
     """
-    return {"clausulazos": _read_clausulazos()}
+    return {"fichajes": _read_fichajes()}
 
 
-@app.post("/market/clausulazos", tags=["Clausulazos"], status_code=201)
-async def add_clausulazo(item: ClausulazoItem):
+@app.post("/market/fichajes", tags=["Fichajes"], status_code=201)
+async def add_fichaje(item: FichajeItem):
     """Añade un jugador a la lista de espera de fichajes por cláusula."""
-    data = _read_clausulazos()
+    data = _read_fichajes()
     # Evitar duplicados
     if any(c["player_id"] == item.player_id for c in data):
         raise HTTPException(status_code=409, detail="El jugador ya está en la lista")
     data.append(item.model_dump())
-    _write_clausulazos(data)
+    _write_fichajes(data)
     return {"added": item.model_dump(), "total": len(data)}
 
 
-@app.delete("/market/clausulazos/{player_id}", tags=["Clausulazos"])
-async def remove_clausulazo(player_id: str):
+@app.delete("/market/fichajes/{player_id}", tags=["Fichajes"])
+async def remove_fichaje(player_id: str):
     """Elimina un jugador de la lista de espera."""
-    data = _read_clausulazos()
+    data = _read_fichajes()
     new_data = [c for c in data if c["player_id"] != player_id]
     if len(new_data) == len(data):
         raise HTTPException(status_code=404, detail="Jugador no encontrado en la lista")
-    _write_clausulazos(new_data)
+    _write_fichajes(new_data)
     return {"removed": player_id, "remaining": len(new_data)}
 
 
-@app.delete("/market/clausulazos", tags=["Clausulazos"])
-async def clear_clausulazos():
+@app.delete("/market/fichajes", tags=["Fichajes"])
+async def clear_fichajes():
     """Vacía la lista de espera completa."""
-    _write_clausulazos([])
+    _write_fichajes([])
     return {"status": "cleared"}
 
 
-@app.post("/market/clausulazos/fire", tags=["Clausulazos"])
-async def fire_clausulazos(
+@app.post("/market/fichajes/fire", tags=["Fichajes"])
+async def fire_fichajes(
     retries: int = Query(20, ge=1, le=50,
         description="Veces que se reintenta cada cláusula (default 20, como en bots de medianoche)"),
     sleep_ms: int = Query(200, ge=50, le=2000,
@@ -2920,17 +2967,17 @@ async def fire_clausulazos(
     - Ideal para lanzar justo a las 00:00 cuando Futmondo renueva las cláusulas.
 
     ```
-    POST /market/clausulazos/fire?retries=20&sleep_ms=200
+    POST /market/fichajes/fire?retries=20&sleep_ms=200
     ```
     """
-    clausulazos = _read_clausulazos()
-    if not clausulazos:
+    fichajes = _read_fichajes()
+    if not fichajes:
         return {"status": "empty", "results": []}
 
     results = []
     signed_ids = []
 
-    for item in clausulazos:
+    for item in fichajes:
         pid   = item["player_id"]
         slug  = item["player_slug"]
         price = item["price"]
@@ -2971,14 +3018,14 @@ async def fire_clausulazos(
 
     # Limpiar la lista de los fichados con éxito
     if clear_on_success and signed_ids:
-        remaining = [c for c in clausulazos if c["player_id"] not in signed_ids]
-        _write_clausulazos(remaining)
+        remaining = [c for c in fichajes if c["player_id"] not in signed_ids]
+        _write_fichajes(remaining)
 
     ok_count  = sum(1 for r in results if r["status"] == "ok")
     return {
-        "fired":         len(clausulazos),
+        "fired":         len(fichajes),
         "signed":        ok_count,
-        "failed":        len(clausulazos) - ok_count,
+        "failed":        len(fichajes) - ok_count,
         "retries_used":  retries,
         "sleep_ms":      sleep_ms,
         "results":       results,
