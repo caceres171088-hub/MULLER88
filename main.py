@@ -144,9 +144,9 @@ class PayClauseRequest(BaseModel):
 
 class AutoPlayRequest(BaseModel):
     dry_run: bool = Field(True, description="Solo planifica, no ejecuta. Pon False para ejecutar de verdad.")
-    # Ventas
-    sell_bottom_pct: float = Field(0.25, ge=0.0, le=1.0,
-        description="Vende el X% inferior de la plantilla por rendimiento (0.25 = 25% peores)")
+    # Ventas — desactivadas por defecto: esperamos a que nos roben
+    sell_bottom_pct: float = Field(0.0, ge=0.0, le=1.0,
+        description="Vende el X% inferior de la plantilla (0.0 = no vender, estrategia de esperar robo)")
     sell_min_avg: float = Field(0.0, ge=0.0,
         description="Protege jugadores con avg_per_game ≥ este valor. 0 = sin protección")
     sell_markup: float = Field(0.10, ge=0.0, le=0.5,
@@ -174,8 +174,8 @@ class AutoRunRequest(BaseModel):
         ),
     )
     sell_bottom_pct: float = Field(
-        0.25, ge=0.0, le=1.0,
-        description="Vende el X% inferior de tu plantilla por eficiencia (0.25 = 25% peores)",
+        0.0, ge=0.0, le=1.0,
+        description="Vende el X% inferior de tu plantilla por eficiencia (0.0 = no vender, estrategia de esperar robo)",
     )
     sell_price_markup: float = Field(
         0.10, ge=0.0, le=0.5,
@@ -3309,8 +3309,8 @@ _MAX_LOG             = 500
 class AutoGestioneConfig(BaseModel):
     enabled:               bool  = Field(False,  description="Activar/desactivar (persiste en disco)")
     check_interval_minutes: int  = Field(30, ge=1, le=1440, description="Minutos entre ciclos completos")
-    # ── Ventas ──────────────────────────────────────────────────────────────
-    auto_sell:         bool  = Field(True,  description="Vender los peores jugadores automáticamente")
+    # ── Ventas — desactivadas por defecto ────────────────────────────────────
+    auto_sell:         bool  = Field(False, description="Vender los peores jugadores automáticamente (desactivado: esperamos a que nos roben)")
     sell_bottom_pct:   float = Field(0.20, ge=0.0, le=1.0, description="% inferior de la plantilla a vender por ciclo")
     sell_min_avg:      float = Field(6.0,  ge=0.0, description="Proteger jugadores con avg ≥ este valor (0 = sin protección)")
     sell_price_markup: float = Field(0.10, ge=0.0, le=0.5, description="Markup sobre valor al poner en venta")
