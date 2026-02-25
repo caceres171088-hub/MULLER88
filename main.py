@@ -28,11 +28,23 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from futmondo_client import FutmondoAuth, FutmondoClient
+
+
+# ---------------------------------------------------------------------------
+# Constantes globales
+# ---------------------------------------------------------------------------
+
+LALIGA_TOTAL_JORNADAS = 38
+STARTING_BUDGET       = 200_000_000
+MONEY_PER_POINT       = 150_000
+TARGET_PTS_JORNADA    = 180
+MAX_ROSTER_SIZE       = 12
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +193,7 @@ class AutoRunRequest(BaseModel):
         ),
     )
     target_jornada: float = Field(
-        150.0, ge=1.0,
+        180.0, ge=1.0,
         description="Objetivo de puntos totales del XI por jornada. Muestra el gap en la respuesta.",
     )
 
@@ -191,7 +203,6 @@ class AutoRunRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _handle_error(exc: Exception) -> None:
-    import httpx
     if isinstance(exc, httpx.HTTPStatusError):
         raise HTTPException(
             status_code=exc.response.status_code,
@@ -307,10 +318,14 @@ async def remove_from_market(
         _handle_error(exc)
 
 
+class DirectSellRequest(BaseModel):
+    player_slug: str = Field(..., description="Slug del jugador (campo 'slug' del roster)")
+
+
 @app.post("/team/directsell/{player_id}", tags=["Mercado"])
 async def direct_sell_player(
     player_id: str,
-    player_slug: str,
+    body: DirectSellRequest,
     client: FutmondoClient = Depends(get_client),
 ):
     """
@@ -322,7 +337,7 @@ async def direct_sell_player(
     Usa el `player_slug` del jugador (campo `slug` del roster).
     """
     try:
-        return await client.direct_sell(player_id, player_slug)
+        return await client.direct_sell(player_id, body.player_slug)
     except Exception as exc:
         _handle_error(exc)
 
@@ -1187,13 +1202,6 @@ async def health():
     return {"status": "ok", "service": "Futmondo Team Manager API"}
 
 
-# ── Helpers de estadísticas ────────────────────────────────────────────────────
-LALIGA_TOTAL_JORNADAS = 38
-STARTING_BUDGET       = 200_000_000
-MONEY_PER_POINT       = 150_000
-TARGET_PTS_JORNADA    = 180
-
-
 # ── Rivals intelligence ────────────────────────────────────────────────────────
 
 @app.get("/rivals/intel", tags=["Inteligencia"])
@@ -1242,9 +1250,9 @@ async def rivals_intel(
         money_earned   = STARTING_BUDGET + pts * MONEY_PER_POINT
         estimated_cash = money_earned - total_invested   # aproximación
 
-        avgs   = [_avg_per_game(p) for p in roster if _avg_per_game(p) > 0]
-        xi_avg = round(sorted(avgs, reverse=True)[:11].__add__([0]*11)[0:11] and
-                       sum(sorted(avgs, reverse=True)[:11]) / min(11, len(avgs)), 2) if avgs else 0
+        avgs    = [_avg_per_game(p) for p in roster if _avg_per_game(p) > 0]
+        top11   = sorted(avgs, reverse=True)[:11]
+        xi_avg  = round(sum(top11) / len(top11), 2) if top11 else 0
 
         most_expensive = max(roster, key=lambda p: float(p.get("buyPrice") or 0), default=None)
         on_market_cnt  = sum(1 for p in roster if p.get("market"))
