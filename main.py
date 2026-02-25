@@ -22,8 +22,11 @@ Endpoints disponibles:
 """
 
 import asyncio
+import json
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -2831,4 +2834,152 @@ async def auto_play(
             "steal_ok":     stolen_ok if not body.dry_run else 0,
             "errors":       [a for a in sell_plan + steal_plan if a.get("status") == "error"],
         },
+    }
+
+
+# ── Clausulazos — lista de espera para fichajes automáticos ───────────────────
+
+_CLAUSULAZOS_FILE = Path(__file__).parent / "clausulazos.json"
+
+
+def _read_clausulazos() -> list[dict]:
+    if _CLAUSULAZOS_FILE.exists():
+        return json.loads(_CLAUSULAZOS_FILE.read_text())
+    return []
+
+
+def _write_clausulazos(data: list[dict]) -> None:
+    _CLAUSULAZOS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+class ClausulazoItem(BaseModel):
+    player_id:   str   = Field(..., description="ID del jugador (campo '_id' del roster rival)")
+    player_slug: str   = Field(..., description="Slug del jugador")
+    price:       int   = Field(..., gt=0, description="Precio exacto de la cláusula")
+    name:        str   = Field("",  description="Nombre descriptivo (opcional)")
+
+
+@app.get("/market/clausulazos", tags=["Clausulazos"])
+async def list_clausulazos():
+    """
+    **Lista de espera de fichajes** — jugadores que se intentarán fichar por cláusula
+    en el próximo disparo (`POST /market/clausulazos/fire`).
+
+    El patrón recomendado (inspirado en bots de alta frecuencia) es ejecutar
+    `/fire` con `retries=20` justo a medianoche, cuando Futmondo renueva las cláusulas.
+    """
+    return {"clausulazos": _read_clausulazos()}
+
+
+@app.post("/market/clausulazos", tags=["Clausulazos"], status_code=201)
+async def add_clausulazo(item: ClausulazoItem):
+    """Añade un jugador a la lista de espera de fichajes por cláusula."""
+    data = _read_clausulazos()
+    # Evitar duplicados
+    if any(c["player_id"] == item.player_id for c in data):
+        raise HTTPException(status_code=409, detail="El jugador ya está en la lista")
+    data.append(item.model_dump())
+    _write_clausulazos(data)
+    return {"added": item.model_dump(), "total": len(data)}
+
+
+@app.delete("/market/clausulazos/{player_id}", tags=["Clausulazos"])
+async def remove_clausulazo(player_id: str):
+    """Elimina un jugador de la lista de espera."""
+    data = _read_clausulazos()
+    new_data = [c for c in data if c["player_id"] != player_id]
+    if len(new_data) == len(data):
+        raise HTTPException(status_code=404, detail="Jugador no encontrado en la lista")
+    _write_clausulazos(new_data)
+    return {"removed": player_id, "remaining": len(new_data)}
+
+
+@app.delete("/market/clausulazos", tags=["Clausulazos"])
+async def clear_clausulazos():
+    """Vacía la lista de espera completa."""
+    _write_clausulazos([])
+    return {"status": "cleared"}
+
+
+@app.post("/market/clausulazos/fire", tags=["Clausulazos"])
+async def fire_clausulazos(
+    retries: int = Query(20, ge=1, le=50,
+        description="Veces que se reintenta cada cláusula (default 20, como en bots de medianoche)"),
+    sleep_ms: int = Query(200, ge=50, le=2000,
+        description="Milisegundos entre intentos (default 200 ms)"),
+    clear_on_success: bool = Query(True,
+        description="Eliminar de la lista los jugadores fichados con éxito"),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Dispara los fichajes de la lista de espera** con reintentos rápidos.
+
+    Patrón de medianoche (idéntico al Telegram bot):
+    - Ejecuta cada cláusula `retries` veces con `sleep_ms` ms entre intentos.
+    - Se detiene en el primer éxito para cada jugador.
+    - Ideal para lanzar justo a las 00:00 cuando Futmondo renueva las cláusulas.
+
+    ```
+    POST /market/clausulazos/fire?retries=20&sleep_ms=200
+    ```
+    """
+    clausulazos = _read_clausulazos()
+    if not clausulazos:
+        return {"status": "empty", "results": []}
+
+    results = []
+    signed_ids = []
+
+    for item in clausulazos:
+        pid   = item["player_id"]
+        slug  = item["player_slug"]
+        price = item["price"]
+        name  = item.get("name", pid)
+
+        result = {"name": name, "player_id": pid, "price": price,
+                  "attempts": 0, "status": "not_tried", "error": None}
+
+        for attempt in range(1, retries + 1):
+            result["attempts"] = attempt
+            try:
+                resp = await client.pay_player_clause(pid, slug, price)
+                ans  = resp.get("answer", {}) if isinstance(resp, dict) else {}
+                if isinstance(ans, dict) and not ans.get("error"):
+                    result["status"] = "ok"
+                    signed_ids.append(pid)
+                    break
+                else:
+                    err = ans.get("code", "unknown") if isinstance(ans, dict) else "unknown"
+                    result["error"] = err
+                    # Errores fatales: no reintentar
+                    if err in ("api.market.max_number_players_in_roster",
+                               "api.error.not_found"):
+                        result["status"] = "fatal_error"
+                        break
+                    result["status"] = "retrying"
+            except Exception as exc:
+                result["error"] = str(exc)
+                result["status"] = "exception"
+
+            if attempt < retries:
+                await asyncio.sleep(sleep_ms / 1000)
+
+        if result["status"] == "retrying":
+            result["status"] = "exhausted"
+
+        results.append(result)
+
+    # Limpiar la lista de los fichados con éxito
+    if clear_on_success and signed_ids:
+        remaining = [c for c in clausulazos if c["player_id"] not in signed_ids]
+        _write_clausulazos(remaining)
+
+    ok_count  = sum(1 for r in results if r["status"] == "ok")
+    return {
+        "fired":         len(clausulazos),
+        "signed":        ok_count,
+        "failed":        len(clausulazos) - ok_count,
+        "retries_used":  retries,
+        "sleep_ms":      sleep_ms,
+        "results":       results,
     }
