@@ -164,10 +164,10 @@ class FutmondoClient:
         return await self._post("GET_MY_PLAYERS_IN_MARKET")
 
     async def set_player_in_market(self, player_id: str, player_slug: str, price: int) -> dict:
-        """Pone un jugador a la venta en el mercado."""
+        """Pone un jugador a la venta en el mercado (con cláusula habilitada — regla del juego)."""
         return await self._post(
             "SET_PLAYER_IN_MARKET",
-            {"player_id": player_id, "player_slug": player_slug, "price": price, "isClause": False},
+            {"player_id": player_id, "player_slug": player_slug, "price": price, "isClause": True},
         )
 
     async def remove_player_from_market(self, player_id: str) -> dict:

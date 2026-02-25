@@ -125,8 +125,8 @@ class AutoRunRequest(BaseModel):
         description="Vende el X% inferior de tu plantilla por eficiencia (0.25 = 25% peores)",
     )
     sell_price_markup: float = Field(
-        0.10, ge=0.0, le=5.0,
-        description="Precio de venta = valor_jugador × (1 + markup). 0.10 = 10% sobre valor",
+        0.10, ge=0.0, le=0.5,
+        description="Precio de venta = valor_jugador × (1 + markup), siempre ≤ valor × 1.5 (regla Futmondo). 0.10 = 10% sobre valor",
     )
     buy_min_profit: float = Field(
         0.10, ge=0.0, le=10.0,
@@ -862,8 +862,10 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
             value = float(_get_field(p, "value", "marketValue") or 0)
             buy_price = float(p.get("buyPrice") or 0)
             # Nunca vender por debajo del precio de compra
+            # Regla Futmondo: precio máximo = valor × 1.5 (valor + mitad del valor)
             base = max(value, buy_price)
-            price = max(1, int(base * (1 + body.sell_price_markup)))
+            max_allowed = int(value * 1.5) if value > 0 else int(base * 1.5)
+            price = min(max(1, int(base * (1 + body.sell_price_markup))), max_allowed)
             sell_actions.append({
                 "player": _player_summary(p, "sell"),
                 "list_price": price,
@@ -2204,4 +2206,346 @@ async def stats_targets(
         "total_found":        len(targets),
         "filters":            {"min_avg": min_avg, "max_clause": max_clause or "sin_límite"},
         "targets":            targets,
+    }
+
+
+# ── War Room: execute attack ───────────────────────────────────────────────────
+
+@app.post("/warroom/execute-attack", tags=["Guerra"])
+async def execute_attack(
+    prefer_gk:       bool  = Query(True,          description="Priorizar robos de portero (máximo daño)"),
+    max_clause_gk:   float = Query(150_000_000,   description="Cláusula máxima para portero"),
+    max_clause_any:  float = Query(300_000_000,   description="Cláusula máxima cualquier jugador"),
+    min_avg:         float = Query(7.0,            description="Media mínima del objetivo"),
+    top:             int   = Query(3,   ge=1, le=5, description="Máximo de robos a ejecutar"),
+    dry_run:         bool  = Query(False,          description="Solo planifica, no ejecuta"),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Ataque pre-jornada — roba los jugadores más vulnerables ahora mismo.**
+
+    Estrategia agresiva:
+    1. GK de rival con 1 solo portero → -5 pts garantizados + XI roto
+    2. Rivales confiados (offline >12h) primero (no reaccionarán)
+    3. Mejor jugador disponible por avg si no hay portero robable
+
+    Solo ejecuta si hay huecos libres en el roster (máx 12 activos).
+    """
+    now = datetime.now(timezone.utc)
+
+    my_raw    = await client.get_team_players()
+    my_players = _extract_list(my_raw)
+    on_market  = sum(1 for p in my_players if p.get("market"))
+    active_cnt = len(my_players) - on_market
+    free_slots = max(0, 12 - len(my_players))
+
+    if free_slots == 0 and not dry_run:
+        return {
+            "status":    "roster_full",
+            "message":   f"Roster lleno ({len(my_players)}/12 jugadores, {on_market} en venta). Espera a que expiren listings.",
+            "free_slots": 0,
+            "dry_run":   dry_run,
+        }
+
+    my_ids = {_get_field(p, "_id", "id") for p in my_players}
+
+    champ_raw   = await client.get_championship_info()
+    inner       = champ_raw.get("answer", champ_raw) if isinstance(champ_raw, dict) else {}
+    champ_teams = inner.get("teams", []) if isinstance(inner, dict) else []
+    my_id       = client.user_team_id
+    rival_teams = [t for t in champ_teams if (t.get("teamid") or t.get("id")) != my_id]
+
+    async def fetch(t):
+        tid = t.get("teamid") or t.get("id")
+        try:
+            raw = await client.get_team_players(team_id=tid)
+            return t, _extract_list(raw)
+        except Exception:
+            return t, []
+
+    all_rosters = await asyncio.gather(*[fetch(t) for t in rival_teams])
+
+    # Build prioritized attack list
+    attack_candidates = []
+    for team_info, roster in all_rosters:
+        team_name = team_info.get("teamname") or team_info.get("name", "?")
+        last_acc  = team_info.get("lastAccess") or ""
+        hours_offline = None
+        if last_acc:
+            try:
+                la = datetime.fromisoformat(last_acc.replace("Z", "+00:00"))
+                hours_offline = (now - la).total_seconds() / 3600
+            except Exception:
+                pass
+
+        confiado   = (hours_offline or 0) > 12
+        gks        = [p for p in roster if p.get("role", "").lower() == "portero"]
+        only_one_gk = len(gks) == 1
+
+        for p in roster:
+            pid = _get_field(p, "_id", "id")
+            if pid in my_ids:
+                continue
+            role     = p.get("role", "").lower()
+            is_gk    = role == "portero"
+            avg      = _avg_per_game(p)
+            c_price  = _clause_price(p)
+            cl       = p.get("clause") or {}
+            transferred = cl.get("transferred", False) if isinstance(cl, dict) else False
+            c_hours  = _clause_hours_left(p)
+
+            if transferred or c_price <= 0 or (c_hours is not None and c_hours <= 0):
+                continue
+            if avg < min_avg:
+                continue
+
+            # GK of single-GK team → maximum damage
+            is_gk_target = is_gk and only_one_gk and c_price <= max_clause_gk and prefer_gk
+            if not is_gk_target and c_price > max_clause_any:
+                continue
+
+            priority = 0
+            if is_gk_target:
+                priority += 1000  # GK steal = maximum damage
+            if confiado:
+                priority += 200
+            priority += avg * 10
+            priority -= c_price / 1_000_000  # cheaper = easier to afford
+
+            attack_candidates.append({
+                "name":         p.get("name"),
+                "role":         role,
+                "team":         team_name,
+                "avg_per_game": round(avg, 2),
+                "clause_price": int(c_price),
+                "clause_hours_left": round(c_hours, 1) if c_hours else None,
+                "confiado":     confiado,
+                "hours_offline": round(hours_offline, 1) if hours_offline else 0,
+                "is_gk_killer": is_gk_target,
+                "only_one_gk":  only_one_gk,
+                "priority":     round(priority, 2),
+                "damage":       "¡GK ÚNICO ROBADO → -5 pts + XI roto!" if is_gk_target else f"avg {avg:.2f}/j",
+                "id":           pid,
+                "slug":         p.get("slug"),
+            })
+
+    attack_candidates.sort(key=lambda x: -x["priority"])
+    plan = attack_candidates[:top]
+
+    if dry_run or free_slots == 0:
+        return {
+            "status":     "plan" if dry_run else "roster_full_plan",
+            "dry_run":    dry_run,
+            "free_slots": free_slots,
+            "roster":     {"total": len(my_players), "active": active_cnt, "on_market": on_market},
+            "attack_plan": plan,
+            "warning":    None if free_slots > 0 else f"Roster lleno — libera slots primero. {on_market} jugadores en venta.",
+        }
+
+    # Execute attacks for available free slots
+    executed = []
+    errors   = []
+    slots_used = 0
+
+    for target in plan:
+        if slots_used >= free_slots:
+            break
+        pid   = target["id"]
+        slug  = target["slug"]
+        price = target["clause_price"]
+        resp  = await client.pay_player_clause(pid, str(slug), price)
+        ans   = resp.get("answer", {}) if isinstance(resp, dict) else {}
+        if isinstance(ans, dict) and ans.get("error"):
+            err_code = ans.get("code", "unknown")
+            errors.append({**target, "error": err_code})
+            if err_code == "api.market.max_number_players_in_roster":
+                break  # roster full, stop
+        else:
+            executed.append({**target, "status": "stolen"})
+            slots_used += 1
+
+    return {
+        "status":       "executed",
+        "dry_run":      False,
+        "free_slots":   free_slots,
+        "slots_used":   slots_used,
+        "stolen":       executed,
+        "errors":       errors,
+        "roster_after": {"total": len(my_players) + slots_used},
+    }
+
+
+# ── War Room: 180 pts attack plan ─────────────────────────────────────────────
+
+@app.get("/warroom/plan180", tags=["Guerra"])
+async def plan180(
+    jornadas_remaining: int   = Query(16, ge=1,  description="Jornadas restantes en la temporada"),
+    max_clause:         float = Query(0,  ge=0,  description="Cláusula máxima por jugador (0=sin límite)"),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Plan de ataque para 180 pts/jornada.**
+
+    Analiza la plantilla actual vs objetivo de 180 pts/jornada y genera:
+    1. **Gap analysis**: cuántos pts faltan y qué avg necesita cada posición
+    2. **Jugadores a vender**: los que lastran el equipo (peor avg)
+    3. **Jugadores a fichar**: rivales con avg alto que acercan al objetivo
+    4. **Cash plan**: cuánto necesitas, cuánto tienes, qué vender primero
+    5. **Formación óptima**: XI que maximiza puntos con plantilla actual
+    """
+    now = datetime.now(timezone.utc)
+
+    # ── Datos propios ─────────────────────────────────────────────────────────
+    my_raw    = await client.get_team_players()
+    my_players = _extract_list(my_raw)
+
+    budget_raw = await client.get_user_info()
+    budget_ans = budget_raw.get("answer", budget_raw) if isinstance(budget_raw, dict) else {}
+    # Futmondo stores cash in mondos/money/balance field
+    cash = 0.0
+    if isinstance(budget_ans, dict):
+        for key in ("mondos", "money", "balance", "cash", "coins"):
+            v = budget_ans.get(key)
+            if isinstance(v, (int, float)):
+                cash = float(v)
+                break
+        # May be nested inside a team or user object
+        if cash == 0.0:
+            for sub in budget_ans.values():
+                if isinstance(sub, dict):
+                    for key in ("mondos", "money", "balance", "cash", "coins"):
+                        v = sub.get(key)
+                        if isinstance(v, (int, float)):
+                            cash = float(v)
+                            break
+                if cash:
+                    break
+
+    xi = _best_lineup_analysis(my_players, TARGET_PTS_JORNADA)
+    current_proj = xi.get("projected_pts_jornada", 0)
+    gap          = TARGET_PTS_JORNADA - current_proj
+    avg_needed   = TARGET_PTS_JORNADA / 11  # ~16.4/player avg needed
+
+    # ── Jugadores a vender (peor eficiencia, liberar cash) ───────────────────
+    active_players = [p for p in my_players if not p.get("market")]
+    sorted_by_eff  = sorted(active_players, key=lambda p: _avg_per_game(p))
+
+    sell_plan = []
+    for p in sorted_by_eff:
+        avg     = _avg_per_game(p)
+        value   = float(p.get("value") or 0)
+        buy_p   = float(p.get("buyPrice") or 0)
+        # Regla Futmondo: cláusula máxima = valor × 1.5 (valor + mitad del valor)
+        max_clause_allowed = int(value * 1.5) if value > 0 else int(buy_p * 1.5)
+        sell_at = min(int(max(value, buy_p) * 1.10), max_clause_allowed)
+        sell_plan.append({
+            "name":      p.get("name"),
+            "role":      p.get("role"),
+            "avg_per_game": round(avg, 2),
+            "value":     int(value),
+            "buy_price": int(buy_p),
+            "sell_at":   sell_at,
+            "profit":    sell_at - int(buy_p),
+            "below_target_avg": avg < avg_needed,
+        })
+
+    # ── Rivales con avg alto — fichajas objetivo ──────────────────────────────
+    champ_raw   = await client.get_championship_info()
+    inner       = champ_raw.get("answer", champ_raw) if isinstance(champ_raw, dict) else {}
+    champ_teams = inner.get("teams", []) if isinstance(inner, dict) else []
+    my_id       = client.user_team_id
+    rival_teams = [t for t in champ_teams if (t.get("teamid") or t.get("id")) != my_id]
+
+    async def fetch(t):
+        tid = t.get("teamid") or t.get("id")
+        try:
+            raw = await client.get_team_players(team_id=tid)
+            return _extract_list(raw)
+        except Exception:
+            return []
+
+    all_rosters = await asyncio.gather(*[fetch(t) for t in rival_teams])
+    my_ids      = {_get_field(p, "_id", "id") for p in my_players}
+
+    target_list = []
+    for roster in all_rosters:
+        for p in roster:
+            pid     = _get_field(p, "_id", "id")
+            if pid in my_ids:
+                continue
+            avg     = _avg_per_game(p)
+            c_price = _clause_price(p)
+            cl      = p.get("clause") or {}
+            transferred = cl.get("transferred", False) if isinstance(cl, dict) else False
+            c_hours = _clause_hours_left(p)
+            if transferred or c_price <= 0 or (c_hours is not None and c_hours <= 0):
+                continue
+            if avg < 7.0:
+                continue
+            if max_clause and c_price > max_clause:
+                continue
+            last5 = float((p.get("average") or {}).get("averageLastFive") or avg)
+            target_list.append({
+                "name":         p.get("name"),
+                "role":         p.get("role"),
+                "avg_per_game": round(avg, 2),
+                "last5_avg":    round(last5, 2),
+                "clause_price": int(c_price),
+                "clause_hours_left": round(c_hours, 1) if c_hours else None,
+                "above_target_avg": avg >= avg_needed,
+                "affordable":   c_price <= cash,
+                "id":           pid,
+                "slug":         p.get("slug"),
+            })
+
+    target_list.sort(key=lambda x: -x["avg_per_game"])
+    top_signings = target_list[:15]
+
+    # ── Cash plan ─────────────────────────────────────────────────────────────
+    # Estimate cash if we sell worst players
+    cumulative_cash = cash
+    cash_steps = []
+    for sp in sell_plan[:5]:
+        cumulative_cash += sp["sell_at"]
+        cash_steps.append({
+            "sell": sp["name"],
+            "gain": sp["sell_at"],
+            "cumulative_cash": int(cumulative_cash),
+        })
+
+    # Estimate new avg after swapping worst players for top targets
+    new_avg_projection = current_proj
+    if sell_plan and top_signings:
+        worst_avg  = sell_plan[0]["avg_per_game"] if sell_plan else 0
+        best_steal = top_signings[0]["avg_per_game"] if top_signings else 0
+        improvement_per_swap = best_steal - worst_avg
+        new_avg_projection = current_proj + improvement_per_swap
+
+    season_pts_now    = current_proj * jornadas_remaining
+    season_pts_target = TARGET_PTS_JORNADA * jornadas_remaining
+
+    return {
+        "target":  TARGET_PTS_JORNADA,
+        "current": {
+            "projected_pts_jornada": round(current_proj, 2),
+            "gap_to_target":         round(gap, 2),
+            "formation":             xi.get("formation"),
+            "avg_needed_per_player": round(avg_needed, 2),
+            "cash_available":        int(cash),
+            "season_pts_remaining":  round(season_pts_now, 1),
+        },
+        "after_one_swap_estimate": round(new_avg_projection, 2),
+        "sell_plan": sell_plan,
+        "signing_targets": top_signings,
+        "cash_plan": {
+            "current_cash":         int(cash),
+            "sell_steps":           cash_steps,
+            "total_after_5_sales":  int(cumulative_cash),
+        },
+        "season_outlook": {
+            "jornadas_remaining":   jornadas_remaining,
+            "pts_at_current_pace":  round(season_pts_now, 1),
+            "pts_if_target_met":    round(season_pts_target, 1),
+            "pts_gap_season":       round(season_pts_target - season_pts_now, 1),
+        },
     }
