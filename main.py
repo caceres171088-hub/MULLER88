@@ -112,6 +112,29 @@ class PayClauseRequest(BaseModel):
     price: int = Field(..., gt=0, description="Precio exacto de la cláusula (campo clause.price del jugador)")
 
 
+class AutoPlayRequest(BaseModel):
+    dry_run: bool = Field(True, description="Solo planifica, no ejecuta. Pon False para ejecutar de verdad.")
+    # Ventas
+    sell_bottom_pct: float = Field(0.25, ge=0.0, le=1.0,
+        description="Vende el X% inferior de la plantilla por rendimiento (0.25 = 25% peores)")
+    sell_min_avg: float = Field(0.0, ge=0.0,
+        description="Protege jugadores con avg_per_game ≥ este valor. 0 = sin protección")
+    sell_markup: float = Field(0.10, ge=0.0, le=0.5,
+        description="Precio de venta = valor × (1 + markup), cap automático en valor×1.5 (regla Futmondo)")
+    # Fichajes por cláusula
+    steal_top: int = Field(3, ge=0, le=5,
+        description="Máximo de fichajes por cláusula a ejecutar")
+    steal_max_clause: float = Field(150_000_000, ge=0,
+        description="Presupuesto máximo por cláusula (0 = sin límite)")
+    steal_min_avg: float = Field(7.0, ge=0.0,
+        description="Media mínima del objetivo para ficharlo")
+    prefer_gk: bool = Field(True,
+        description="Priorizar robo de portero único rival (máximo daño competitivo)")
+    # Alineación
+    target_jornada: float = Field(180.0, ge=1.0,
+        description="Objetivo de pts/jornada para el análisis de plantilla y gap")
+
+
 class AutoRunRequest(BaseModel):
     dry_run: bool = Field(
         True,
@@ -2547,5 +2570,235 @@ async def plan180(
             "pts_at_current_pace":  round(season_pts_now, 1),
             "pts_if_target_met":    round(season_pts_target, 1),
             "pts_gap_season":       round(season_pts_target - season_pts_now, 1),
+        },
+    }
+
+
+# ── Auto/Play: ventas + fichajes por cláusula + alineación ────────────────────
+
+@app.post("/auto/play", tags=["Automático", "Guerra"])
+async def auto_play(
+    body: AutoPlayRequest,
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Todo en un solo paso: vende, ficha y muestra la alineación óptima.**
+
+    Flujo de ejecución:
+    1. **Ventas** — lista los jugadores con peor rendimiento al precio máximo permitido (valor×1.5)
+    2. **Fichajes** — roba por cláusula a los rivales más rentables, priorizando:
+       - Portero único del rival (garantiza -5 pts al rival + XI roto)
+       - Rivales offline >12h (no reaccionarán)
+       - Mayor avg_per_game
+    3. **Alineación** — calcula el XI óptimo con la plantilla resultante
+
+    Siempre usa `dry_run=true` primero para revisar el plan antes de ejecutar.
+    """
+    now = datetime.now(timezone.utc)
+
+    # ── 1. Datos propios y del campeonato (en paralelo) ───────────────────────
+    team_raw, champ_raw = await asyncio.gather(
+        client.get_team_players(),
+        client.get_championship_info(),
+    )
+    my_players = _extract_list(team_raw)
+    on_market  = sum(1 for p in my_players if p.get("market"))
+    free_slots = max(0, 12 - len(my_players))
+
+    inner       = champ_raw.get("answer", champ_raw) if isinstance(champ_raw, dict) else {}
+    champ_teams = inner.get("teams", []) if isinstance(inner, dict) else []
+    my_id       = client.user_team_id
+    rival_teams = [t for t in champ_teams if (t.get("teamid") or t.get("id")) != my_id]
+
+    my_ids = {_get_field(p, "_id", "id") for p in my_players}
+
+    # ── 2. FASE VENTAS ────────────────────────────────────────────────────────
+    active = [p for p in my_players if not p.get("market")]
+    gks    = [p for p in active if p.get("role", "").lower() == "portero"]
+
+    # Ordenar por avg_per_game ASC (peores primero)
+    sorted_by_eff = sorted(active, key=lambda p: _avg_per_game(p))
+
+    sell_candidates = []
+    for p in sorted_by_eff:
+        pid  = _get_field(p, "_id", "id")
+        avg  = _avg_per_game(p)
+        role = p.get("role", "").lower()
+        # Nunca vender el único portero
+        if role == "portero" and len(gks) <= 1:
+            continue
+        # Respetar protección por avg
+        if body.sell_min_avg > 0 and avg >= body.sell_min_avg:
+            continue
+        sell_candidates.append(p)
+
+    sell_count = max(1, int(len(sell_candidates) * body.sell_bottom_pct)) if sell_candidates else 0
+    sell_targets = sell_candidates[:sell_count]
+
+    sell_plan = []
+    for p in sell_targets:
+        pid      = _get_field(p, "_id", "id")
+        slug     = p.get("slug")
+        value    = float(_get_field(p, "value", "marketValue") or 0)
+        buy_p    = float(p.get("buyPrice") or 0)
+        base     = max(value, buy_p)
+        max_cap  = int(value * 1.5) if value > 0 else int(base * 1.5)
+        price    = min(max(1, int(base * (1 + body.sell_markup))), max_cap)
+        action = {
+            "name":         p.get("name"),
+            "role":         p.get("role"),
+            "avg_per_game": round(_avg_per_game(p), 2),
+            "value":        int(value),
+            "buy_price":    int(buy_p),
+            "list_price":   price,
+            "profit":       price - int(buy_p),
+            "status":       "pending",
+            "error":        None,
+            "_pid":         pid,
+            "_slug":        slug,
+        }
+        sell_plan.append(action)
+
+    if not body.dry_run:
+        for action in sell_plan:
+            await _exec_action(
+                client.set_player_in_market(action["_pid"], action["_slug"], action["list_price"]),
+                action,
+            )
+
+    sold_ok = sum(1 for a in sell_plan if a.get("status") == "ok")
+
+    # ── 3. FASE FICHAJES (WARROOM) ────────────────────────────────────────────
+    async def _fetch_rival(t):
+        tid = t.get("teamid") or t.get("id")
+        try:
+            raw = await client.get_team_players(team_id=tid)
+            return t, _extract_list(raw)
+        except Exception:
+            return t, []
+
+    all_rosters = await asyncio.gather(*[_fetch_rival(t) for t in rival_teams])
+
+    steal_candidates = []
+    for team_info, roster in all_rosters:
+        team_name   = team_info.get("teamname") or team_info.get("name", "?")
+        last_acc    = team_info.get("lastAccess") or ""
+        hours_offline = None
+        if last_acc:
+            try:
+                la = datetime.fromisoformat(last_acc.replace("Z", "+00:00"))
+                hours_offline = (now - la).total_seconds() / 3600
+            except Exception:
+                pass
+
+        confiado    = (hours_offline or 0) > 12
+        team_gks    = [p for p in roster if p.get("role", "").lower() == "portero"]
+        only_one_gk = len(team_gks) == 1
+
+        for p in roster:
+            pid     = _get_field(p, "_id", "id")
+            if pid in my_ids:
+                continue
+            role    = p.get("role", "").lower()
+            is_gk   = role == "portero"
+            avg     = _avg_per_game(p)
+            c_price = _clause_price(p)
+            cl      = p.get("clause") or {}
+            transferred = cl.get("transferred", False) if isinstance(cl, dict) else False
+            c_hours = _clause_hours_left(p)
+
+            if transferred or c_price <= 0 or (c_hours is not None and c_hours <= 0):
+                continue
+            if avg < body.steal_min_avg:
+                continue
+            if body.steal_max_clause > 0 and c_price > body.steal_max_clause:
+                continue
+
+            is_gk_kill = is_gk and only_one_gk and body.prefer_gk
+            priority   = 0
+            if is_gk_kill:
+                priority += 1000
+            if confiado:
+                priority += 200
+            priority += avg * 10
+            priority -= c_price / 1_000_000
+
+            steal_candidates.append({
+                "name":             p.get("name"),
+                "role":             p.get("role"),
+                "team":             team_name,
+                "avg_per_game":     round(avg, 2),
+                "clause_price":     int(c_price),
+                "clause_hours_left": round(c_hours, 1) if c_hours is not None else None,
+                "confiado":         confiado,
+                "hours_offline":    round(hours_offline, 1) if hours_offline else 0,
+                "is_gk_killer":     is_gk_kill,
+                "priority":         round(priority, 2),
+                "status":           "pending",
+                "error":            None,
+                "_id":              pid,
+                "_slug":            p.get("slug"),
+            })
+
+    steal_candidates.sort(key=lambda x: -x["priority"])
+    # Slots disponibles tras las ventas (en dry_run vendidos no liberan slots reales)
+    effective_free = free_slots + (sold_ok if not body.dry_run else 0)
+    steal_plan = steal_candidates[:min(body.steal_top, max(0, effective_free))]
+
+    stolen_ok = 0
+    if not body.dry_run:
+        for action in steal_plan:
+            if stolen_ok >= effective_free:
+                break
+            resp = await client.pay_player_clause(action["_id"], action["_slug"], action["clause_price"])
+            ans  = resp.get("answer", {}) if isinstance(resp, dict) else {}
+            if isinstance(ans, dict) and ans.get("error"):
+                err_code = ans.get("code", "unknown")
+                action["status"] = "error"
+                action["error"]  = err_code
+                if err_code == "api.market.max_number_players_in_roster":
+                    break
+            else:
+                action["status"] = "ok"
+                stolen_ok += 1
+    else:
+        steal_plan = steal_candidates[:body.steal_top]
+
+    # ── 4. FASE ALINEACIÓN ────────────────────────────────────────────────────
+    lineup = _best_lineup_analysis(my_players, target_apg=body.target_jornada)
+
+    # Limpiar claves internas (_pid, _slug, _id) de la respuesta
+    for a in sell_plan:
+        a.pop("_pid", None)
+        a.pop("_slug", None)
+    for a in steal_plan:
+        a.pop("_id", None)
+        a.pop("_slug", None)
+
+    return {
+        "dry_run": body.dry_run,
+        "status":  "plan" if body.dry_run else "executed",
+        "roster": {
+            "total":      len(my_players),
+            "active":     len(my_players) - on_market,
+            "on_market":  on_market,
+            "free_slots": free_slots,
+        },
+        "sell_plan":  sell_plan,
+        "steal_plan": steal_plan,
+        "lineup": {
+            "formation":             lineup.get("formation"),
+            "projected_pts_jornada": round(lineup.get("projected_pts_jornada", 0), 2),
+            "gap_to_target":         round(lineup.get("gap_to_target", 0), 2),
+            "target":                body.target_jornada,
+            "starters":              lineup.get("starters", []),
+            "bench":                 lineup.get("bench", []),
+        },
+        "summary": {
+            "sell_total":   len(sell_plan),
+            "sell_ok":      sold_ok if not body.dry_run else 0,
+            "steal_total":  len(steal_plan),
+            "steal_ok":     stolen_ok if not body.dry_run else 0,
+            "errors":       [a for a in sell_plan + steal_plan if a.get("status") == "error"],
         },
     }
