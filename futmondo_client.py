@@ -34,6 +34,7 @@ ENDPOINTS = {
     "MODIFY_BID": "/5/market/modifybid",
     "GET_TEAM_PLAYERS": "/1/userteam/roster",
     "PRESSROOM": "/1/locker/pressroom",
+    "DIRECT_SELL": "/1/market/directsell",
 }
 
 
@@ -210,6 +211,14 @@ class FutmondoClient:
         return await self._post(
             "GET_PLAYER_DATA",
             {"player_id": player_id},
+        )
+
+    async def direct_sell(self, player_id: str, player_slug: str) -> dict:
+        """Venta directa: elimina al jugador de la plantilla de forma inmediata.
+        Equivalente al botón 'Venta directa' en la app. No requiere fijar precio."""
+        return await self._post(
+            "DIRECT_SELL",
+            {"player_id": player_id, "player_slug": player_slug},
         )
 
     async def get_pressroom(self) -> dict:

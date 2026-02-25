@@ -304,6 +304,26 @@ async def remove_from_market(
         _handle_error(exc)
 
 
+@app.post("/team/directsell/{player_id}", tags=["Mercado"])
+async def direct_sell_player(
+    player_id: str,
+    player_slug: str,
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Venta directa** — elimina al jugador de tu plantilla de forma inmediata.
+
+    Equivalente al botón 'Venta directa' de la app. No requiere fijar precio ni
+    esperar a que alguien compre: el jugador sale al instante y libera hueco.
+
+    Usa el `player_slug` del jugador (campo `slug` del roster).
+    """
+    try:
+        return await client.direct_sell(player_id, player_slug)
+    except Exception as exc:
+        _handle_error(exc)
+
+
 @app.patch("/market/hide/{player_id}", tags=["Mercado"])
 async def toggle_player_visibility(
     player_id: str, client: FutmondoClient = Depends(get_client)
@@ -2661,10 +2681,20 @@ async def auto_play(
 
     if not body.dry_run:
         for action in sell_plan:
-            await _exec_action(
-                client.set_player_in_market(action["_pid"], action["_slug"], action["list_price"]),
-                action,
-            )
+            # Venta directa: elimina el jugador al instante, libera hueco de inmediato.
+            # Si falla (p.ej. jugador recién fichado sin ventana de venta), recurre a
+            # ponerlo en mercado al precio calculado.
+            direct = await client.direct_sell(action["_pid"], action["_slug"])
+            direct_ans = direct.get("answer", {}) if isinstance(direct, dict) else {}
+            if isinstance(direct_ans, dict) and not direct_ans.get("error"):
+                action["status"] = "ok"
+                action["method"] = "direct_sell"
+            else:
+                await _exec_action(
+                    client.set_player_in_market(action["_pid"], action["_slug"], action["list_price"]),
+                    action,
+                )
+                action.setdefault("method", "market_listing")
 
     sold_ok = sum(1 for a in sell_plan if a.get("status") == "ok")
 
