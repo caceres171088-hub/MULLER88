@@ -43,7 +43,8 @@ from futmondo_client import FutmondoAuth, FutmondoClient
 LALIGA_TOTAL_JORNADAS = 38
 STARTING_BUDGET       = 200_000_000
 MONEY_PER_POINT       = 150_000
-TARGET_PTS_JORNADA    = 180
+TARGET_PTS_JORNADA    = 90     # objetivo mínimo: 90 pts del XI por jornada
+MIN_AVG_PER_PLAYER    = round(TARGET_PTS_JORNADA / 11, 2)   # ≈ 8.18 pts/j
 MAX_ROSTER_SIZE       = 12
 
 
@@ -156,8 +157,8 @@ class AutoPlayRequest(BaseModel):
         description="Máximo de fichajes por cláusula a ejecutar")
     steal_max_clause: float = Field(150_000_000, ge=0,
         description="Presupuesto máximo por cláusula (0 = sin límite)")
-    steal_min_avg: float = Field(7.0, ge=0.0,
-        description="Media mínima del objetivo para ficharlo")
+    steal_min_avg: float = Field(MIN_AVG_PER_PLAYER, ge=0.0,
+        description="Media mínima del objetivo para ficharlo (default: 90pts/11 jugadores)")
     prefer_gk: bool = Field(True,
         description="Priorizar robo de portero único rival (máximo daño competitivo)")
     # Alineación
@@ -192,8 +193,8 @@ class AutoRunRequest(BaseModel):
         description="Eficiencia mínima (avg_pts/jornada por millón) — ignorar si steal_min_avg > 0",
     )
     steal_min_avg: float = Field(
-        7.0, ge=0.0,
-        description="Sólo robar jugadores con avg_per_game >= este valor. 0 = sin filtro por rendimiento",
+        MIN_AVG_PER_PLAYER, ge=0.0,
+        description="Sólo robar jugadores con avg_per_game >= este valor (default: 90pts/11 jugadores ≈ 8.18)",
     )
     steal_max_clause: float = Field(
         0.0, ge=0.0,
@@ -208,8 +209,8 @@ class AutoRunRequest(BaseModel):
         ),
     )
     target_jornada: float = Field(
-        180.0, ge=1.0,
-        description="Objetivo de puntos totales del XI por jornada. Muestra el gap en la respuesta.",
+        TARGET_PTS_JORNADA, ge=1.0,
+        description="Objetivo de puntos totales del XI por jornada.",
     )
 
 
@@ -982,11 +983,7 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
             slug = p.get("slug")
             value = float(_get_field(p, "value", "marketValue") or 0)
             buy_price = float(p.get("buyPrice") or 0)
-            # Nunca vender por debajo del precio de compra
-            # Regla Futmondo: precio máximo = valor × 1.5 (valor + mitad del valor)
-            base = max(value, buy_price)
-            max_allowed = int(value * 1.5) if value > 0 else int(base * 1.5)
-            price = min(max(1, int(base * (1 + body.sell_price_markup))), max_allowed)
+            price = _compute_sell_price(value, buy_price)
             sell_actions.append({
                 "player": _player_summary(p, "sell"),
                 "list_price": price,
@@ -1178,7 +1175,7 @@ async def reprice_market(
         slug  = p.get("slug")
         value = float(_get_field(p, "value", "marketValue") or 0)
         old_price = float(_get_field(p, "price", "sellPrice") or 0)
-        new_price = max(1_000_000, int(value * (1 + markup)))
+        new_price = max(1_000_000, _compute_sell_price(value, old_price))
 
         action = {"player": p.get("name", "?"), "old_price": int(old_price), "new_price": new_price, "status": "pending", "error": None}
         if pid and slug and new_price != int(old_price):
@@ -1970,6 +1967,121 @@ async def defense_alert(client: FutmondoClient = Depends(get_client)):
     }
 
 
+# ── Helpers de cláusula ──────────────────────────────────────────────────────
+
+def _compute_sell_price(value: float, buy_price: float) -> int:
+    """
+    Precio de venta según la regla de la liga:
+      precio = valor_mercado + 50%  (= valor × 1.5)
+    Nunca por debajo del precio de compra para no perder dinero.
+    isClause siempre activado por el cliente HTTP.
+    """
+    return max(int(value * 1.5), int(buy_price))
+
+
+def _suggested_clause(player: dict) -> float:
+    """Cláusula mínima sugerida por Futmondo. Por debajo → sanción."""
+    cl = player.get("clause")
+    if isinstance(cl, dict):
+        return float(cl.get("suggestedClause") or 0)
+    return 0.0
+
+
+def _clause_sanction_status(player: dict) -> str:
+    """
+    Devuelve el estado de la cláusula respecto a la sugerida:
+      SANCION   — precio < sugerida  → el sistema sancionará al manager
+      MINIMO    — precio == sugerida → en el límite justo
+      OK        — precio > sugerida  → protegido
+      SIN_DATO  — no hay sugerida registrada
+    """
+    price     = _clause_price(player)
+    suggested = _suggested_clause(player)
+    if price == 0:
+        return "VULNERABLE"
+    if suggested <= 0:
+        return "SIN_DATO"
+    if price < suggested:
+        return "SANCION"
+    if price == suggested:
+        return "MINIMO"
+    return "OK"
+
+
+@app.get("/defense/clause-check", tags=["Estrategia"])
+async def clause_check(client: FutmondoClient = Depends(get_client)):
+    """
+    **Auditoría de cláusulas — detecta jugadores con cláusula inferior a la mínima.**
+
+    Futmondo sanciona al manager cuando la cláusula de un jugador está por
+    debajo del valor sugerido (`suggestedClause`). Este endpoint escanea toda
+    la plantilla y clasifica cada jugador:
+
+    - **SANCION** — `clause_price < suggested_clause` → actuar ahora
+    - **MINIMO**  — precio exactamente en el mínimo → en el límite
+    - **OK**      — precio por encima de la sugerida → protegido
+    - **VULNERABLE** — sin cláusula activa
+    - **SIN_DATO** — la API no devuelve la sugerida
+
+    Acción recomendada: retirar del mercado y re-listar con cláusula correcta.
+    """
+    try:
+        raw = await client.get_team_players()
+    except Exception as exc:
+        _handle_error(exc)
+
+    players = _extract_list(raw)
+    now     = datetime.now(timezone.utc)
+    result  = []
+
+    for p in players:
+        price     = _clause_price(p)
+        suggested = _suggested_clause(p)
+        deficit   = max(0.0, suggested - price)
+        status    = _clause_sanction_status(p)
+        cl        = p.get("clause") or {}
+        expiry    = _clause_expiry(p)
+        hours     = _clause_hours_left(p)
+
+        result.append({
+            "name":             p.get("name", "?"),
+            "role":             p.get("role", "?"),
+            "avg_per_game":     round(_avg_per_game(p), 2),
+            "on_market":        bool(p.get("market")),
+            "clause_price":     int(price),
+            "suggested_clause": int(suggested),
+            "deficit":          int(deficit),
+            "sanction_status":  status,
+            "clause_expires":   expiry.isoformat() if expiry else None,
+            "hours_until_expiry": round(hours, 1) if hours is not None else None,
+            "id":               _get_field(p, "_id", "id"),
+            "slug":             p.get("slug"),
+        })
+
+    # Ordenar: primero los que van a ser sancionados, luego por déficit
+    order = {"SANCION": 0, "VULNERABLE": 1, "MINIMO": 2, "SIN_DATO": 3, "OK": 4}
+    result.sort(key=lambda x: (order.get(x["sanction_status"], 9), -x["deficit"]))
+
+    sanctions = [r for r in result if r["sanction_status"] == "SANCION"]
+    vulnerable = [r for r in result if r["sanction_status"] == "VULNERABLE"]
+
+    return {
+        "generated_at": now.isoformat(),
+        "summary": {
+            "SANCION":    len(sanctions),
+            "MINIMO":     len([r for r in result if r["sanction_status"] == "MINIMO"]),
+            "OK":         len([r for r in result if r["sanction_status"] == "OK"]),
+            "VULNERABLE": len(vulnerable),
+        },
+        "alert": (
+            f"¡{len(sanctions)} jugador(es) con cláusula por debajo del mínimo — SANCIÓN INMINENTE!"
+            if sanctions else
+            "Todas las cláusulas están en orden."
+        ),
+        "players": result,
+    }
+
+
 @app.get("/attack", tags=["Estrategia"])
 async def pre_jornada_attack(
     max_clause:  float = Query(300_000_000, description="Cláusula máxima que estamos dispuestos a pagar"),
@@ -2074,6 +2186,186 @@ async def pre_jornada_attack(
         "attack_plan":     can_now[:15],
         "expiry_soon":     [t for t in can_now if t["hours_left"] is not None and t["hours_left"] < hours_window][:10],
     }
+
+
+# ── Monitor de anomalías ────────────────────────────────────────────────────────
+
+# Señales de uso de bot/API por rivales:
+#  1. Mismo equipo con >1 puja activa en el mercado (escaneo masivo)
+#  2. Jugadores de nuestra plantilla que aparecen en noticias de traspaso hoy
+#  3. Cláusulas pagadas a los pocos segundos de renovarse (timing perfecto = bot)
+#  4. Rivals con lastAccess muy reciente Y múltiples movimientos en poco tiempo
+
+async def _collect_anomalies(client: FutmondoClient) -> dict:
+    """Recopila señales de comportamiento sospechoso. Devuelve el informe."""
+    now   = datetime.now(timezone.utc)
+    today = now.date().isoformat()
+    alerts: list[dict] = []
+
+    # ── A. Cláusulas propias mal puestas (sanción inminente) ─────────────────
+    try:
+        raw      = await client.get_team_players()
+        my_squad = _extract_list(raw)
+        for p in my_squad:
+            status = _clause_sanction_status(p)
+            if status == "SANCION":
+                price     = _clause_price(p)
+                suggested = _suggested_clause(p)
+                alerts.append({
+                    "type":    "SANCION_CLAUSULA",
+                    "level":   "CRITICO",
+                    "player":  p.get("name", "?"),
+                    "detail":  f"Cláusula {int(price):,} < mínima {int(suggested):,} — déficit {int(suggested-price):,}",
+                    "action":  "Retirar del mercado y re-publicar con cláusula correcta",
+                })
+            elif status == "VULNERABLE":
+                alerts.append({
+                    "type":   "SIN_CLAUSULA",
+                    "level":  "ALTO",
+                    "player": p.get("name", "?"),
+                    "detail": "Jugador sin cláusula activa — cualquier rival puede ficharlo gratis",
+                    "action": "Publicar en mercado para activar la cláusula",
+                })
+    except Exception:
+        pass
+
+    # ── B. Fichajes de hoy en sala de prensa (nos han robado un jugador) ─────
+    try:
+        raw_press = await client.get_pressroom()
+        news: list = []
+        if isinstance(raw_press, list):
+            news = raw_press
+        elif isinstance(raw_press, dict):
+            ans = raw_press.get("answer", raw_press)
+            if isinstance(ans, list):
+                news = ans
+            elif isinstance(ans, dict):
+                for v in ans.values():
+                    if isinstance(v, list) and v and isinstance(v[0], dict):
+                        news = v
+                        break
+
+        my_names = {p.get("name", "").lower() for p in my_squad}
+        for item in news:
+            item_date = item.get("date") or item.get("createdAt") or item.get("timestamp") or ""
+            if isinstance(item_date, (int, float)):
+                item_date = datetime.fromtimestamp(item_date / 1000, tz=timezone.utc).date().isoformat()
+            if not str(item_date).startswith(today):
+                continue
+            text = (item.get("text") or item.get("message") or item.get("body") or "").lower()
+            # Buscar si alguno de nuestros jugadores aparece en la noticia
+            for name in my_names:
+                if name and len(name) > 3 and name in text:
+                    alerts.append({
+                        "type":   "JUGADOR_TRASPASADO_HOY",
+                        "level":  "ALTO",
+                        "player": name.title(),
+                        "detail": text[:200],
+                        "action": "Verificar si fue robado por cláusula",
+                    })
+                    break
+    except Exception:
+        pass
+
+    # ── C. Equipos rivales con pujas anómalas en el mercado ──────────────────
+    try:
+        raw_market = await client.get_market()
+        market_players = _extract_list(raw_market)
+
+        bids_per_team: dict[str, int] = {}
+        fast_bidders:  list[dict]     = []
+
+        for p in market_players:
+            bids = p.get("bids") or []
+            if not isinstance(bids, list):
+                continue
+            for b in bids:
+                team = b.get("teamName") or b.get("team") or b.get("userId") or "?"
+                bids_per_team[team] = bids_per_team.get(team, 0) + 1
+
+        # Equipos con ≥3 pujas activas simultáneas → comportamiento de bot
+        for team, count in bids_per_team.items():
+            if count >= 3:
+                fast_bidders.append({"team": team, "active_bids": count})
+                alerts.append({
+                    "type":   "BOT_SOSPECHOSO",
+                    "level":  "MEDIO",
+                    "player": None,
+                    "detail": f"Equipo '{team}' tiene {count} pujas activas simultáneas en el mercado (posible bot/API)",
+                    "action": "Ignorar sus ofertas — probablemente automatizado",
+                })
+    except Exception:
+        pass
+
+    # ── D. Rivales confiados con jugadores robables críticos ─────────────────
+    try:
+        champ_raw   = await client.get_championship_info()
+        inner       = champ_raw.get("answer", champ_raw) if isinstance(champ_raw, dict) else {}
+        champ_teams = inner.get("teams", []) if isinstance(inner, dict) else []
+        for t in champ_teams:
+            if (t.get("teamid") or t.get("id")) == client.user_team_id:
+                continue
+            last_acc = t.get("lastAccess") or ""
+            if not last_acc:
+                continue
+            try:
+                la = datetime.fromisoformat(last_acc.replace("Z", "+00:00"))
+                hours_offline = (now - la).total_seconds() / 3600
+                if hours_offline > 48:
+                    alerts.append({
+                        "type":   "RIVAL_INACTIVO",
+                        "level":  "INFO",
+                        "player": None,
+                        "detail": f"Equipo '{t.get('teamname') or t.get('name','?')}' lleva {hours_offline:.0f}h sin conectarse — no reaccionará a un robo",
+                        "action": "Aprovechar para robar por cláusula",
+                    })
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    level_order = {"CRITICO": 0, "ALTO": 1, "MEDIO": 2, "INFO": 3}
+    alerts.sort(key=lambda a: level_order.get(a["level"], 9))
+
+    criticos = [a for a in alerts if a["level"] == "CRITICO"]
+    altos    = [a for a in alerts if a["level"] == "ALTO"]
+
+    return {
+        "generated_at": now.isoformat(),
+        "summary": {
+            "CRITICO": len(criticos),
+            "ALTO":    len(altos),
+            "MEDIO":   len([a for a in alerts if a["level"] == "MEDIO"]),
+            "INFO":    len([a for a in alerts if a["level"] == "INFO"]),
+        },
+        "global_alert": (
+            "🚨 ACCIÓN INMEDIATA REQUERIDA" if criticos else
+            "⚠️ Hay situaciones que requieren atención" if altos else
+            "✅ Sin anomalías críticas"
+        ),
+        "alerts": alerts,
+    }
+
+
+@app.get("/monitor/anomalies", tags=["Inteligencia"])
+async def monitor_anomalies(client: FutmondoClient = Depends(get_client)):
+    """
+    **Monitor de anomalías — detecta situaciones críticas y comportamiento sospechoso.**
+
+    Escanea en paralelo cuatro fuentes y clasifica las alertas por nivel:
+
+    - **CRITICO** — Cláusulas propias por debajo del mínimo (sanción inminente)
+    - **ALTO**    — Jugador nuestro traspasado hoy / jugador sin cláusula
+    - **MEDIO**   — Rival con ≥3 pujas simultáneas en el mercado (posible bot/API)
+    - **INFO**    — Rival sin conectarse >48h (buena ventana para robar)
+
+    La autogestión ejecuta este monitor en cada ciclo y registra en el log
+    cualquier anomalía de nivel CRITICO o ALTO.
+    """
+    try:
+        return await _collect_anomalies(client)
+    except Exception as exc:
+        _handle_error(exc)
 
 
 # ── Market Watch ───────────────────────────────────────────────────────────────
@@ -2695,9 +2987,7 @@ async def plan180(
         avg     = _avg_per_game(p)
         value   = float(p.get("value") or 0)
         buy_p   = float(p.get("buyPrice") or 0)
-        # Regla Futmondo: cláusula máxima = valor × 1.5 (valor + mitad del valor)
-        max_clause_allowed = int(value * 1.5) if value > 0 else int(buy_p * 1.5)
-        sell_at = min(int(max(value, buy_p) * 1.10), max_clause_allowed)
+        sell_at = _compute_sell_price(value, buy_p)
         sell_plan.append({
             "name":      p.get("name"),
             "role":      p.get("role"),
@@ -2878,9 +3168,7 @@ async def auto_play(
         slug     = p.get("slug")
         value    = float(_get_field(p, "value", "marketValue") or 0)
         buy_p    = float(p.get("buyPrice") or 0)
-        base     = max(value, buy_p)
-        max_cap  = int(value * 1.5) if value > 0 else int(base * 1.5)
-        price    = min(max(1, int(base * (1 + body.sell_markup))), max_cap)
+        price    = _compute_sell_price(value, buy_p)
         change = int(p.get("change") or 0)
         action = {
             "name":         p.get("name"),
@@ -3309,22 +3597,20 @@ _MAX_LOG             = 500
 class AutoGestioneConfig(BaseModel):
     enabled:               bool  = Field(False,  description="Activar/desactivar (persiste en disco)")
     check_interval_minutes: int  = Field(30, ge=1, le=1440, description="Minutos entre ciclos completos")
-    # ── Ventas — desactivadas por defecto ────────────────────────────────────
-    auto_sell:         bool  = Field(False, description="Vender los peores jugadores automáticamente (desactivado: esperamos a que nos roben)")
+    # ── Ventas — desactivadas: esperamos a que nos roben ─────────────────────
+    auto_sell:         bool  = Field(False, description="Vender los peores jugadores (desactivado: esperamos a que nos roben)")
     sell_bottom_pct:   float = Field(0.20, ge=0.0, le=1.0, description="% inferior de la plantilla a vender por ciclo")
-    sell_min_avg:      float = Field(6.0,  ge=0.0, description="Proteger jugadores con avg ≥ este valor (0 = sin protección)")
-    sell_price_markup: float = Field(0.10, ge=0.0, le=0.5, description="Markup sobre valor al poner en venta")
+    sell_min_avg:      float = Field(MIN_AVG_PER_PLAYER, ge=0.0, description="Proteger jugadores con avg ≥ este valor")
     # ── Robos por cláusula ─────────────────────────────────────────────────
     auto_attack:      bool  = Field(True,  description="Robar jugadores rivales automáticamente")
     steal_top:        int   = Field(2, ge=0, le=5, description="Máximo de robos por ciclo")
-    steal_min_avg:    float = Field(7.0,  ge=0.0, description="Media mínima del objetivo para robar")
+    steal_min_avg:    float = Field(MIN_AVG_PER_PLAYER, ge=0.0, description="Media mínima del objetivo (default: 90pts/11j ≈ 8.18)")
     steal_max_clause: float = Field(0.0,  ge=0.0, description="Cláusula máxima a pagar (0 = sin límite)")
     prefer_gk:        bool  = Field(True,  description="Priorizar portero único rival (máximo daño)")
     # ── Mercado ────────────────────────────────────────────────────────────
-    cancel_expiring:      bool  = Field(True,  description="Cancelar listings que expiran sin puja")
-    cancel_hours:         float = Field(3.0, ge=0.5, le=24.0, description="Horas de margen para cancelar sin puja")
-    auto_reprice:         bool  = Field(False, description="Re-preciar listings activos cada ciclo")
-    reprice_markup:       float = Field(0.10, ge=0.0, le=0.5, description="Markup para repreciar listings")
+    cancel_expiring: bool  = Field(True,  description="Cancelar listings que expiran sin puja")
+    cancel_hours:    float = Field(3.0, ge=0.5, le=24.0, description="Horas de margen para cancelar sin puja")
+    auto_reprice:    bool  = Field(True,  description="Re-preciar listings al precio correcto (valor × 1.5)")
     # ── Sniper de fichajes ─────────────────────────────────────────────────
     auto_snipe:      bool = Field(True,  description="Disparar la lista de fichajes en el último segundo")
     snipe_seconds:   int  = Field(10,  ge=3, le=120, description="Segundos antes de expirar en que se dispara")
@@ -3395,7 +3681,7 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
                 slug      = p.get("slug")
                 value     = float(_get_field(p, "value", "marketValue") or 0)
                 old_price = float(_get_field(p, "price", "sellPrice") or 0)
-                new_price = max(1_000_000, int(value * (1 + cfg.reprice_markup)))
+                new_price = max(1_000_000, _compute_sell_price(value, old_price))
                 if pid and slug and new_price != int(old_price):
                     try:
                         await client.remove_player_from_market(pid)
@@ -3427,9 +3713,7 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
                 slug  = p.get("slug")
                 value = float(_get_field(p, "value", "marketValue") or 0)
                 buy_p = float(p.get("buyPrice") or 0)
-                base  = max(value, buy_p)
-                cap   = int(value * 1.5) if value > 0 else int(base * 1.5)
-                price = min(max(1, int(base * (1 + cfg.sell_price_markup))), cap)
+                price = _compute_sell_price(value, buy_p)
                 # Intentar venta directa primero
                 try:
                     direct = await client.direct_sell(pid, str(slug))
@@ -3535,6 +3819,23 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
                         _ag_log("steal", f"Excepción con {name}: {e}", "error")
         except Exception as e:
             _ag_log("auto_attack", f"Error general: {e}", "error")
+
+    # ── 5. Monitor de anomalías y cláusulas ──────────────────────────────────
+    try:
+        report = await _collect_anomalies(client)
+        for alert in report["alerts"]:
+            if alert["level"] in ("CRITICO", "ALTO"):
+                _ag_log(
+                    f"anomaly_{alert['type'].lower()}",
+                    alert["detail"],
+                    "error" if alert["level"] == "CRITICO" else "warning",
+                    {"level": alert["level"], "action": alert["action"],
+                     "player": alert.get("player")},
+                )
+        if report["summary"]["CRITICO"] == 0 and report["summary"]["ALTO"] == 0:
+            _ag_log("monitor_ok", "Sin anomalías críticas en este ciclo", "info")
+    except Exception as e:
+        _ag_log("monitor_anomalies", f"Error en monitor: {e}", "error")
 
     _ag_log("cycle_end", "Ciclo completado")
 
