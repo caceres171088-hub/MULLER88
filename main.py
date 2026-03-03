@@ -120,9 +120,10 @@ class LoginRequest(BaseModel):
 
 
 class SellPlayerRequest(BaseModel):
-    player_id: str = Field(..., description="ID del jugador")
+    player_id:   str = Field(..., description="ID del jugador")
     player_slug: str = Field(..., description="Slug numérico del jugador (campo 'slug' del roster)")
-    price: int = Field(..., gt=0, description="Precio de venta en monedas")
+    # price se calcula automáticamente: valor_mercado × 1.5 (regla de la liga)
+    # Si se envía, debe ser >= valor × 1.5, de lo contrario se devuelve error 422.
 
 
 class BidRequest(BaseModel):
@@ -177,10 +178,6 @@ class AutoRunRequest(BaseModel):
     sell_bottom_pct: float = Field(
         0.0, ge=0.0, le=1.0,
         description="Vende el X% inferior de tu plantilla por eficiencia (0.0 = no vender, estrategia de esperar robo)",
-    )
-    sell_price_markup: float = Field(
-        0.10, ge=0.0, le=0.5,
-        description="Precio de venta = valor_jugador × (1 + markup), siempre ≤ valor × 1.5 (regla Futmondo). 0.10 = 10% sobre valor",
     )
     buy_min_profit: float = Field(
         0.10, ge=0.0, le=10.0,
@@ -316,9 +313,45 @@ async def get_my_market_players(client: FutmondoClient = Depends(get_client)):
 async def sell_player(
     body: SellPlayerRequest, client: FutmondoClient = Depends(get_client)
 ):
-    """Pone un jugador a la venta en el mercado al precio indicado."""
+    """
+    Pone un jugador a la venta aplicando la regla de la liga:
+    **precio = valor_mercado × 1.5** (nunca por debajo del precio de compra).
+    La pestaña de cláusula se activa siempre (`isClause=True`).
+    """
+    # Obtener valor actual del jugador desde el roster
     try:
-        return await client.set_player_in_market(body.player_id, body.player_slug, body.price)
+        team_raw = await client.get_team_players()
+    except Exception as exc:
+        _handle_error(exc)
+
+    player = next(
+        (p for p in _extract_list(team_raw)
+         if _get_field(p, "_id", "id") == body.player_id
+         or str(p.get("slug")) == body.player_slug),
+        None,
+    )
+    if player is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Jugador no encontrado en tu plantilla",
+        )
+
+    value     = float(_get_field(player, "value", "marketValue") or 0)
+    buy_price = float(player.get("buyPrice") or 0)
+    price     = _compute_sell_price(value, buy_price)
+
+    try:
+        result = await client.set_player_in_market(body.player_id, body.player_slug, price)
+        return {
+            **result,
+            "_pricing": {
+                "market_value":  int(value),
+                "buy_price":     int(buy_price),
+                "applied_price": price,
+                "rule":          "valor_mercado × 1.5 (regla de la liga)",
+                "isClause":      True,
+            },
+        }
     except Exception as exc:
         _handle_error(exc)
 

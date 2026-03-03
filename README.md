@@ -128,7 +128,6 @@ Parámetros configurables:
 |---|---|---|
 | `dry_run` | `true` | Solo simula, no ejecuta |
 | `sell_bottom_pct` | `0.25` | Vende el 25% inferior de tu plantilla |
-| `sell_price_markup` | `0.10` | Vende al 110% del valor |
 | `buy_min_profit` | `0.10` | Solo compra si hay ≥10% de descuento |
 | `buy_top` | `5` | Máximo 5 jugadores a comprar |
 | `steal_top` | `3` | Máximo 3 robos por cláusula |
