@@ -3723,6 +3723,9 @@ class AutoGestioneConfig(BaseModel):
     auto_snipe:      bool = Field(True,  description="Disparar la lista de fichajes en el último segundo")
     snipe_seconds:   int  = Field(10,  ge=3, le=120, description="Segundos antes de expirar en que se dispara")
     snipe_retries:   int  = Field(5,   ge=1, le=20,  description="Reintentos tras el disparo del snipe")
+    # ── Control de saldo ────────────────────────────────────────────────────
+    min_cash_buffer: float = Field(5_000_000, ge=0,
+        description="Saldo mínimo a mantener siempre — nunca gastar si dejaría el saldo por debajo de esta cifra")
     # ── Relleno de huecos urgente ──────────────────────────────────────────
     fill_on_stolen:  bool  = Field(True, description="Si hay huecos vacíos (nos robaron), fichar aunque auto_attack esté desactivado")
     fill_fallback_min_avg: float = Field(4.0, ge=0.0,
@@ -3746,6 +3749,30 @@ def _ag_load_config() -> AutoGestioneConfig:
 
 def _ag_save_config(cfg: AutoGestioneConfig) -> None:
     _AUTOGESTIONE_CONFIG_FILE.write_text(cfg.model_dump_json(indent=2))
+
+
+# ── Saldo disponible ──────────────────────────────────────────────────────────
+
+async def _get_cash(client: FutmondoClient) -> float:
+    """Devuelve el saldo disponible en la cuenta. Devuelve 0 si no se puede obtener."""
+    try:
+        raw = await client.get_user_info()
+        ans = raw.get("answer", raw) if isinstance(raw, dict) else {}
+        if isinstance(ans, dict):
+            for key in ("mondos", "money", "balance", "cash", "coins"):
+                v = ans.get(key)
+                if isinstance(v, (int, float)) and v > 0:
+                    return float(v)
+            # Puede venir anidado
+            for sub in ans.values():
+                if isinstance(sub, dict):
+                    for key in ("mondos", "money", "balance", "cash", "coins"):
+                        v = sub.get(key)
+                        if isinstance(v, (int, float)) and v > 0:
+                            return float(v)
+    except Exception:
+        pass
+    return 0.0
 
 
 # ── Log ───────────────────────────────────────────────────────────────────────
@@ -3923,9 +3950,16 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
 
                 steal_pool.sort(key=lambda x: -x[0])
                 stolen = 0
+                cash = await _get_cash(client)
+                _ag_log("budget", f"Saldo disponible: {cash:,.0f} | Reserva mínima: {cfg.min_cash_buffer:,.0f}", "info")
                 for _, pid, slug, c_price, name, role in steal_pool[:cfg.steal_top]:
                     if stolen >= free_slots:
                         break
+                    # Control de saldo: no robar si deja el saldo por debajo del buffer
+                    if cash - c_price < cfg.min_cash_buffer:
+                        _ag_log("steal", f"SKIP {name} ({c_price:,}) — saldo insuficiente "
+                                f"(disponible={cash:,.0f}, reserva={cfg.min_cash_buffer:,.0f})", "warning")
+                        continue
                     try:
                         resp = await client.pay_player_clause(pid, str(slug), c_price)
                         ans  = resp.get("answer", {}) if isinstance(resp, dict) else {}
@@ -3936,7 +3970,8 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
                                 break
                         else:
                             _ag_log("steal", f"¡ROBADO! {name} ({role}) por {c_price:,}", "ok",
-                                    {"clause_paid": c_price, "player": name})
+                                    {"clause_paid": c_price, "player": name, "cash_after": cash - c_price})
+                            cash -= c_price   # actualizar saldo local para siguientes iteraciones
                             stolen += 1
                     except Exception as e:
                         _ag_log("steal", f"Excepción con {name}: {e}", "error")
@@ -4034,9 +4069,15 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
 
                 fill_pool.sort(key=lambda x: -x[0])
                 filled = 0
+                cash_fill = await _get_cash(client)
                 for _, pid_f, slug_f, c_price_f, name_f, role_f in fill_pool:
                     if filled >= free_slots_now:
                         break
+                    # Control de saldo también en relleno urgente
+                    if cash_fill - c_price_f < cfg.min_cash_buffer:
+                        _ag_log("fill_gap", f"SKIP {name_f} ({c_price_f:,}) — saldo insuficiente "
+                                f"(disponible={cash_fill:,.0f}, reserva={cfg.min_cash_buffer:,.0f})", "warning")
+                        continue
                     try:
                         resp_f = await client.pay_player_clause(pid_f, str(slug_f), c_price_f)
                         ans_f  = resp_f.get("answer", {}) if isinstance(resp_f, dict) else {}
@@ -4047,7 +4088,9 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
                                 break
                         else:
                             _ag_log("fill_gap", f"HUECO RELLENADO: {name_f} ({role_f}) por {c_price_f:,}", "ok",
-                                    {"clause_paid": c_price_f, "player": name_f, "role": role_f})
+                                    {"clause_paid": c_price_f, "player": name_f, "role": role_f,
+                                     "cash_after": cash_fill - c_price_f})
+                            cash_fill -= c_price_f
                             filled += 1
                     except Exception as e_f:
                         _ag_log("fill_gap", f"Excepción rellenando {name_f}: {e_f}", "error")
