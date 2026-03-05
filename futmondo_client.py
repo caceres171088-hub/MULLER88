@@ -35,6 +35,8 @@ ENDPOINTS = {
     "GET_TEAM_PLAYERS": "/1/userteam/roster",
     "PRESSROOM": "/1/locker/pressroom",
     "DIRECT_SELL": "/1/market/directsell",
+    # Alineación
+    "SET_LINEUP": "/1/userteam/lineup",
 }
 
 
@@ -230,6 +232,15 @@ class FutmondoClient:
     async def get_pressroom(self) -> dict:
         """Obtiene la sala de prensa (noticias del equipo)."""
         return await self._post("PRESSROOM")
+
+    async def set_lineup(self, player_slugs: list[str]) -> dict:
+        """
+        Aplica la alineación (titulares) en Futmondo.
+
+        player_slugs: lista de slugs de los 11 titulares en orden posicional.
+        Endpoint: POST /1/userteam/lineup
+        """
+        return await self._post("SET_LINEUP", {"players": player_slugs})
 
     async def close(self):
         """Cierra el cliente HTTP."""

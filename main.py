@@ -733,20 +733,25 @@ def _best_lineup_analysis(players: list[dict], target_apg: float = 150.0) -> dic
     """
     Prueba todas las formaciones usando rol principal y secundario (role2).
     Rankea por avg_per_game y devuelve progreso hacia el objetivo de puntos/jornada.
+    Solo coloca como titulares a jugadores disponibles (_is_available).
+    Los lesionados/sancionados van directamente al banquillo.
     """
+    available = [p for p in players if _is_available(p)]
+    unavailable = [p for p in players if not _is_available(p)]
+
     best: dict | None = None
     best_total = -1.0
 
     for f in _FORMATIONS:
         needed = {"GK": 1, "DEF": f["DEF"], "MID": f["MID"], "FWD": f["FWD"]}
 
-        # Paso 1: llenar con rol principal
+        # Paso 1: llenar con rol principal (solo disponibles)
         used: set[str] = set()
         assignment: dict[str, list[dict]] = {pos: [] for pos in needed}
 
         primary_pools = {
             pos: sorted(
-                [p for p in players if _primary_pos(p) == pos],
+                [p for p in available if _primary_pos(p) == pos],
                 key=_avg_per_game, reverse=True,
             )
             for pos in needed
@@ -758,12 +763,12 @@ def _best_lineup_analysis(players: list[dict], target_apg: float = 150.0) -> dic
                 assignment[pos].append(p)
                 used.add(_get_field(p, "_id", "id"))
 
-        # Paso 2: rellenar huecos con role2
+        # Paso 2: rellenar huecos con role2 (solo disponibles)
         for pos, n in needed.items():
             if len(assignment[pos]) >= n:
                 continue
             r2_pool = sorted(
-                [p for p in players
+                [p for p in available
                  if _get_field(p, "_id", "id") not in used and _secondary_pos(p) == pos],
                 key=_avg_per_game, reverse=True,
             )
@@ -790,7 +795,8 @@ def _best_lineup_analysis(players: list[dict], target_apg: float = 150.0) -> dic
                     summary = _player_summary(p, "lineup")
                     summary["assigned_pos"] = pos
                     summary["avg_per_game"] = _avg_per_game(p)
-                    # Marcar si juega fuera de su rol principal
+                    summary["available"] = True
+                    summary["availability"] = _availability_label(p)
                     if _primary_pos(p) != pos:
                         summary["playing_as_role2"] = True
                     starters.append(summary)
@@ -803,8 +809,8 @@ def _best_lineup_analysis(players: list[dict], target_apg: float = 150.0) -> dic
             }
 
     if best is None:
-        # Fallback: los 11 mejores por avg_per_game sin filtrar formación
-        top11 = sorted(players, key=_avg_per_game, reverse=True)[:11]
+        # Fallback: los 11 mejores disponibles por avg_per_game
+        top11 = sorted(available, key=_avg_per_game, reverse=True)[:11]
         total_apg = sum(_avg_per_game(p) for p in top11)
         best = {
             "formation": "libre",
@@ -812,20 +818,39 @@ def _best_lineup_analysis(players: list[dict], target_apg: float = 150.0) -> dic
             "target_pts_jornada": target_apg,
             "gap_to_target": round(target_apg - total_apg, 2),
             "starters": [
-                {**_player_summary(p, "lineup"), "avg_per_game": _avg_per_game(p)}
+                {**_player_summary(p, "lineup"), "avg_per_game": _avg_per_game(p),
+                 "available": True, "availability": _availability_label(p)}
                 for p in top11
             ],
         }
 
-    # Suplentes
+    # Suplentes: disponibles no titulares + NO disponibles (con etiqueta de estado)
     starter_ids = {s["id"] for s in best["starters"]}
-    bench = sorted(
-        [p for p in players if _get_field(p, "_id", "id") not in starter_ids],
+    bench_available = sorted(
+        [p for p in available if _get_field(p, "_id", "id") not in starter_ids],
         key=_avg_per_game, reverse=True,
     )
-    best["bench"] = [
-        {**_player_summary(p, "lineup"), "avg_per_game": _avg_per_game(p)}
-        for p in bench
+    bench_unavailable = sorted(unavailable, key=_avg_per_game, reverse=True)
+
+    bench_entries = []
+    for p in bench_available:
+        entry = _player_summary(p, "lineup")
+        entry["avg_per_game"] = _avg_per_game(p)
+        entry["available"] = True
+        entry["availability"] = _availability_label(p)
+        bench_entries.append(entry)
+    for p in bench_unavailable:
+        entry = _player_summary(p, "lineup")
+        entry["avg_per_game"] = _avg_per_game(p)
+        entry["available"] = False
+        entry["availability"] = _availability_label(p)
+        bench_entries.append(entry)
+
+    best["bench"] = bench_entries
+    best["unavailable_count"] = len(unavailable)
+    best["unavailable"] = [
+        {"name": p.get("name"), "role": p.get("role"), "status": _availability_label(p)}
+        for p in unavailable
     ]
     return best
 
@@ -2574,6 +2599,56 @@ async def cancel_expiring(
     }
 
 
+def _is_available(player: dict) -> bool:
+    """
+    Devuelve False si el jugador está lesionado, sancionado o no disponible.
+
+    Futmondo usa varios campos para indicar disponibilidad:
+      - active: False / 0 → no disponible
+      - status / playerStatus: 0=OK, 1=duda, 2=lesionado, 3=sancionado
+      - injuryStatus: campo alternativo en algunas versiones de la API
+    Los valores 0/False/None se consideran DISPONIBLE.
+    Los valores ≥ 2 en status numérico se consideran NO DISPONIBLE.
+    """
+    # Campo booleano / entero activo
+    active = player.get("active")
+    if active is not None and not active:
+        return False
+
+    # Campo status (numérico): 0=ok, 1=duda, 2=lesionado, 3=sancionado
+    for field in ("status", "playerStatus", "injuryStatus", "playeractive"):
+        val = player.get(field)
+        if val is None:
+            continue
+        if isinstance(val, bool):
+            if not val:
+                return False
+        elif isinstance(val, int):
+            if val >= 2:   # 2=lesionado, 3=sancionado
+                return False
+        elif isinstance(val, str):
+            if val.lower() in ("injured", "lesionado", "suspended", "sancionado",
+                               "out", "unavailable", "baja", "lesion", "sancion"):
+                return False
+    return True
+
+
+def _availability_label(player: dict) -> str:
+    """Etiqueta legible del estado de disponibilidad."""
+    if not _is_available(player):
+        for field in ("status", "playerStatus", "injuryStatus"):
+            val = player.get(field)
+            if isinstance(val, int) and val >= 2:
+                return {2: "LESIONADO", 3: "SANCIONADO"}.get(val, "NO_DISPONIBLE")
+            if isinstance(val, str):
+                return val.upper()
+        return "NO_DISPONIBLE"
+    status_val = player.get("status") or player.get("playerStatus")
+    if isinstance(status_val, int) and status_val == 1:
+        return "DUDA"
+    return "OK"
+
+
 def _fitness(player: dict) -> list[float]:
     """Últimas N jornadas (scores individuales), de más antigua a más reciente."""
     avg = player.get("average") or {}
@@ -3648,6 +3723,14 @@ class AutoGestioneConfig(BaseModel):
     auto_snipe:      bool = Field(True,  description="Disparar la lista de fichajes en el último segundo")
     snipe_seconds:   int  = Field(10,  ge=3, le=120, description="Segundos antes de expirar en que se dispara")
     snipe_retries:   int  = Field(5,   ge=1, le=20,  description="Reintentos tras el disparo del snipe")
+    # ── Relleno de huecos urgente ──────────────────────────────────────────
+    fill_on_stolen:  bool  = Field(True, description="Si hay huecos vacíos (nos robaron), fichar aunque auto_attack esté desactivado")
+    fill_fallback_min_avg: float = Field(4.0, ge=0.0,
+        description="Media mínima de emergencia para rellenar huecos si no hay candidatos con steal_min_avg")
+    # ── Alineación automática ──────────────────────────────────────────────
+    auto_lineup:     bool  = Field(True, description="Calcular y aplicar alineación óptima en cada ciclo")
+    target_pts_jornada: float = Field(float(TARGET_PTS_JORNADA), ge=1.0,
+        description="Objetivo de puntos/jornada del XI para la alineación óptima")
 
 
 # ── Persistencia de config ─────────────────────────────────────────────────────
@@ -3820,15 +3903,22 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
 
                         if transferred or c_price <= 0 or (c_hours is not None and c_hours <= 0):
                             continue
+                        # Descartar jugadores lesionados o sancionados del rival
+                        if not _is_available(p):
+                            continue
                         if avg < cfg.steal_min_avg:
                             continue
                         if cfg.steal_max_clause > 0 and c_price > cfg.steal_max_clause:
                             continue
 
-                        prio = (1000 if (role == "portero" and only_one_gk and cfg.prefer_gk) else 0)
-                        prio += 200 if confiado else 0
-                        prio += avg * 10
-                        prio -= c_price / 1_000_000
+                        # Prioridad = máximos puntos (avg) > portero único > confiado
+                        # La cláusula solo desempata (no penaliza fuerte)
+                        prio = avg * 100   # avg es el factor dominante (máx puntos)
+                        if role == "portero" and only_one_gk and cfg.prefer_gk:
+                            prio += 1000
+                        if confiado:
+                            prio += 20
+                        prio -= c_price / 10_000_000  # desempate suave por precio
                         steal_pool.append((prio, pid, p.get("slug"), int(c_price), p.get("name", "?"), role))
 
                 steal_pool.sort(key=lambda x: -x[0])
@@ -3853,6 +3943,122 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
         except Exception as e:
             _ag_log("auto_attack", f"Error general: {e}", "error")
 
+    # ── 4b. RELLENO URGENTE: si quedan huecos, bajar el umbral ───────────────
+    # Se ejecuta aunque auto_attack=False si fill_on_stolen=True
+    if cfg.fill_on_stolen:
+        try:
+            my_raw_check = await client.get_team_players()
+            my_players_check = _extract_list(my_raw_check)
+            free_slots_now = max(0, MAX_ROSTER_SIZE - len(my_players_check))
+
+            if free_slots_now > 0:
+                _ag_log("fill_gap", f"HAY {free_slots_now} HUECO(S) — iniciando relleno urgente", "warning")
+                my_ids_check = {_get_field(p, "_id", "id") for p in my_players_check}
+
+                # Calcular posiciones que nos faltan para una XI completo
+                pos_in_squad = {"GK": 0, "DEF": 0, "MID": 0, "FWD": 0}
+                for p in my_players_check:
+                    pos = _normalize_pos(p)
+                    if pos in pos_in_squad:
+                        pos_in_squad[pos] += 1
+                # Qué posiciones son más urgentes (menos representadas)
+                pos_priority = sorted(pos_in_squad, key=lambda pp: pos_in_squad[pp])
+
+                champ_raw_f = await client.get_championship_info()
+                inner_f = champ_raw_f.get("answer", champ_raw_f) if isinstance(champ_raw_f, dict) else {}
+                rival_teams_f = [
+                    t for t in (inner_f.get("teams", []) if isinstance(inner_f, dict) else [])
+                    if (t.get("teamid") or t.get("id")) != client.user_team_id
+                ]
+
+                async def _fetch_rf(t):
+                    tid = t.get("teamid") or t.get("id")
+                    try:
+                        return t, _extract_list(await client.get_team_players(team_id=tid))
+                    except Exception:
+                        return t, []
+
+                now_f = datetime.now(timezone.utc)
+                all_rosters_f = await asyncio.gather(*[_fetch_rf(t) for t in rival_teams_f])
+
+                fill_pool: list[tuple] = []
+                for team_info_f, roster_f in all_rosters_f:
+                    team_name_f = team_info_f.get("teamname") or team_info_f.get("name", "?")
+                    last_acc_f  = team_info_f.get("lastAccess") or ""
+                    h_offline_f = None
+                    if last_acc_f:
+                        try:
+                            la_f = datetime.fromisoformat(last_acc_f.replace("Z", "+00:00"))
+                            h_offline_f = (now_f - la_f).total_seconds() / 3600
+                        except Exception:
+                            pass
+                    confiado_f    = (h_offline_f or 0) > 12
+                    only_one_gk_f = sum(1 for p in roster_f if p.get("role", "").lower() == "portero") == 1
+
+                    for p in roster_f:
+                        pid_f = _get_field(p, "_id", "id")
+                        if pid_f in my_ids_check:
+                            continue
+                        avg_f     = _avg_per_game(p)
+                        c_price_f = _clause_price(p)
+                        cl_f      = p.get("clause") or {}
+                        if cl_f.get("transferred", False) if isinstance(cl_f, dict) else False:
+                            continue
+                        c_hours_f = _clause_hours_left(p)
+                        if c_price_f <= 0 or (c_hours_f is not None and c_hours_f <= 0):
+                            continue
+                        # No fichar lesionados/sancionados aunque haya urgencia
+                        if not _is_available(p):
+                            continue
+                        if avg_f < cfg.fill_fallback_min_avg:
+                            continue  # descarta jugadores muy malos incluso en urgencia
+                        if cfg.steal_max_clause > 0 and c_price_f > cfg.steal_max_clause:
+                            continue
+
+                        role_f  = p.get("role", "").lower()
+                        is_gk_f = role_f == "portero"
+                        norm_pos_f = _normalize_pos(p)
+                        # Bonus posicional: rellenamos la posición más escasa primero
+                        pos_bonus = 0
+                        if norm_pos_f in pos_priority:
+                            pos_bonus = (len(pos_priority) - pos_priority.index(norm_pos_f)) * 50
+                        # Prioridad = máximos puntos (avg) > posición urgente > portero único
+                        prio_f = avg_f * 100 + pos_bonus
+                        if is_gk_f and only_one_gk_f and cfg.prefer_gk:
+                            prio_f += 1000
+                        if confiado_f:
+                            prio_f += 20
+                        prio_f -= c_price_f / 10_000_000
+                        fill_pool.append((prio_f, pid_f, p.get("slug"), int(c_price_f),
+                                          p.get("name", "?"), role_f))
+
+                fill_pool.sort(key=lambda x: -x[0])
+                filled = 0
+                for _, pid_f, slug_f, c_price_f, name_f, role_f in fill_pool:
+                    if filled >= free_slots_now:
+                        break
+                    try:
+                        resp_f = await client.pay_player_clause(pid_f, str(slug_f), c_price_f)
+                        ans_f  = resp_f.get("answer", {}) if isinstance(resp_f, dict) else {}
+                        if isinstance(ans_f, dict) and ans_f.get("error"):
+                            err_f = ans_f.get("code", "unknown")
+                            _ag_log("fill_gap", f"Error rellenando con {name_f}: {err_f}", "error")
+                            if err_f == "api.market.max_number_players_in_roster":
+                                break
+                        else:
+                            _ag_log("fill_gap", f"HUECO RELLENADO: {name_f} ({role_f}) por {c_price_f:,}", "ok",
+                                    {"clause_paid": c_price_f, "player": name_f, "role": role_f})
+                            filled += 1
+                    except Exception as e_f:
+                        _ag_log("fill_gap", f"Excepción rellenando {name_f}: {e_f}", "error")
+
+                if filled == 0 and free_slots_now > 0:
+                    _ag_log("fill_gap",
+                            f"Sin candidatos válidos para rellenar {free_slots_now} hueco(s) "
+                            f"(avg_min={cfg.fill_fallback_min_avg}). Roster incompleto.", "warning")
+        except Exception as e:
+            _ag_log("fill_on_stolen", f"Error en relleno urgente: {e}", "error")
+
     # ── 5. Monitor de anomalías y cláusulas ──────────────────────────────────
     try:
         report = await _collect_anomalies(client)
@@ -3869,6 +4075,53 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
             _ag_log("monitor_ok", "Sin anomalías críticas en este ciclo", "info")
     except Exception as e:
         _ag_log("monitor_anomalies", f"Error en monitor: {e}", "error")
+
+    # ── 6. Alineación óptima ──────────────────────────────────────────────────
+    if cfg.auto_lineup:
+        try:
+            team_data_lu = await client.get_team_players()
+            players_lu   = _extract_list(team_data_lu)
+            if players_lu:
+                xi_lu   = _best_lineup_analysis(players_lu, target_apg=cfg.target_pts_jornada)
+                proj_lu = xi_lu.get("projected_pts_jornada", 0)
+                gap_lu  = xi_lu.get("gap_to_target", 0)
+                form_lu = xi_lu.get("formation", "?")
+                starters_names = ", ".join(
+                    s.get("name", "?") for s in xi_lu.get("starters", [])
+                )
+                _ag_log(
+                    "lineup",
+                    f"XI óptimo [{form_lu}] → {proj_lu:.1f} pts/j "
+                    f"({'GAP ' + str(round(gap_lu, 1)) if gap_lu > 0 else 'OBJETIVO ALCANZADO'}) | "
+                    f"{starters_names}",
+                    "ok" if proj_lu >= cfg.target_pts_jornada else "warning",
+                    {
+                        "formation": form_lu,
+                        "projected_pts_jornada": proj_lu,
+                        "gap_to_target": gap_lu,
+                        "target": cfg.target_pts_jornada,
+                        "starters": [s.get("name") for s in xi_lu.get("starters", [])],
+                        "bench":    [s.get("name") for s in xi_lu.get("bench", [])],
+                    },
+                )
+                # Intentar aplicar la alineación en Futmondo si tenemos el endpoint
+                try:
+                    starter_slugs = [
+                        str(s.get("slug")) for s in xi_lu.get("starters", [])
+                        if s.get("slug") is not None
+                    ]
+                    if starter_slugs:
+                        resp_lu = await client.set_lineup(starter_slugs)
+                        ans_lu  = resp_lu.get("answer", {}) if isinstance(resp_lu, dict) else {}
+                        if isinstance(ans_lu, dict) and ans_lu.get("error"):
+                            _ag_log("lineup_apply", f"API rechazó la alineación: {ans_lu.get('code')}", "warning")
+                        else:
+                            _ag_log("lineup_apply", f"Alineación [{form_lu}] aplicada en Futmondo", "ok")
+                except Exception as e_lu:
+                    # El endpoint puede no estar disponible; solo loggear sin parar el ciclo
+                    _ag_log("lineup_apply", f"No se pudo aplicar alineación en Futmondo: {e_lu}", "info")
+        except Exception as e:
+            _ag_log("lineup", f"Error calculando alineación: {e}", "error")
 
     _ag_log("cycle_end", "Ciclo completado")
 
@@ -4109,6 +4362,63 @@ async def autogestione_update_config(
 
     return {"status": "updated", "config": cfg.model_dump(),
             "message": "Configuración guardada — agente detenido (enabled=false)"}
+
+
+@app.post("/auto/gestione/lineup/apply", tags=["Automatización"])
+async def autogestione_apply_lineup(
+    target: float = Query(float(TARGET_PTS_JORNADA), ge=1.0,
+                          description="Objetivo pts/jornada para seleccionar el XI óptimo"),
+    dry_run: bool = Query(True, description="Si True solo devuelve el plan, no aplica en Futmondo"),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Calcula y aplica la alineación óptima en Futmondo.**
+
+    Analiza tu plantilla con todas las formaciones posibles (4-3-3, 4-4-2 …),
+    selecciona el XI que maximiza los puntos por jornada y lo envía a la API
+    de Futmondo para que quede guardado.
+
+    - `dry_run=true` (por defecto): solo devuelve el plan sin aplicarlo.
+    - `dry_run=false`: aplica la alineación directamente.
+
+    Incluido también en el ciclo automático de autogestión cuando `auto_lineup=true`.
+    """
+    try:
+        team_data = await client.get_team_players()
+        players   = _extract_list(team_data)
+    except Exception as exc:
+        _handle_error(exc)
+
+    if not players:
+        raise HTTPException(status_code=404, detail="No se encontraron jugadores en el equipo")
+
+    xi = _best_lineup_analysis(players, target_apg=target)
+    starters = xi.get("starters", [])
+    bench    = xi.get("bench", [])
+
+    apply_result = None
+    if not dry_run and starters:
+        starter_slugs = [str(s["slug"]) for s in starters if s.get("slug") is not None]
+        try:
+            resp = await client.set_lineup(starter_slugs)
+            ans  = resp.get("answer", {}) if isinstance(resp, dict) else {}
+            if isinstance(ans, dict) and ans.get("error"):
+                apply_result = {"status": "error", "code": ans.get("code")}
+            else:
+                apply_result = {"status": "applied", "slugs_sent": starter_slugs}
+        except Exception as exc:
+            apply_result = {"status": "error", "detail": str(exc)}
+
+    return {
+        "dry_run": dry_run,
+        "formation":             xi.get("formation"),
+        "projected_pts_jornada": xi.get("projected_pts_jornada"),
+        "gap_to_target":         xi.get("gap_to_target"),
+        "target":                target,
+        "starters": starters,
+        "bench":    bench,
+        "apply_result": apply_result,
+    }
 
 
 @app.get("/auto/gestione/log", tags=["Automatización"])
