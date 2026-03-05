@@ -1,0 +1,23 @@
+{
+  "enabled": true,
+  "check_interval_minutes": 15,
+  "auto_sell": false,
+  "sell_bottom_pct": 0.0,
+  "sell_min_avg": 8.18,
+  "auto_attack": true,
+  "steal_top": 3,
+  "steal_min_avg": 7.0,
+  "steal_max_clause": 0.0,
+  "prefer_gk": true,
+  "cancel_expiring": true,
+  "cancel_hours": 3.0,
+  "auto_reprice": true,
+  "auto_snipe": true,
+  "snipe_seconds": 10,
+  "snipe_retries": 10,
+  "min_cash_buffer": 5000000.0,
+  "fill_on_stolen": true,
+  "fill_fallback_min_avg": 4.0,
+  "auto_lineup": true,
+  "target_pts_jornada": 90.0
+}
