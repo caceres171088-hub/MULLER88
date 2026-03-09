@@ -4119,6 +4119,105 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
     except Exception as e:
         _ag_log("monitor_anomalies", f"Error en monitor: {e}", "error")
 
+    # ── 5b. Monitor de sancionados/lesionados PROPIOS + robo de refuerzo ─────
+    try:
+        my_raw_s = await client.get_team_players()
+        my_roster_s = _extract_list(my_raw_s)
+        my_ids_s = {_get_field(p, "_id", "id") for p in my_roster_s}
+
+        unavailable_own: list[dict] = []
+        for p in my_roster_s:
+            if not _is_available(p):
+                st_val = None
+                for field in ("status", "playerStatus", "injuryStatus", "playeractive"):
+                    v = p.get(field)
+                    if v is not None:
+                        st_val = v
+                        break
+                reason = "sancionado" if st_val == 3 or str(st_val).lower() in ("suspended", "sancionado") else "lesionado/no disponible"
+                unavailable_own.append({"name": p.get("name", "?"), "role": p.get("role", "?"), "reason": reason, "status": st_val})
+
+        available_count = len(my_roster_s) - len(unavailable_own)
+
+        if unavailable_own:
+            names_str = ", ".join(f"{u['name']} ({u['reason']})" for u in unavailable_own)
+            _ag_log(
+                "own_unavailable",
+                f"{len(unavailable_own)} jugador(es) no disponible(s): {names_str} | XI efectivo: {min(available_count, 11)}/11",
+                "warning" if available_count >= 11 else "error",
+                {"unavailable": unavailable_own, "available_count": available_count},
+            )
+        else:
+            _ag_log("own_unavailable", "Todos los jugadores propios disponibles", "info")
+
+        # Si el XI efectivo queda por debajo de 11, intentar robar refuerzos
+        # aunque el roster no esté vacío (los sancionados ocupan plaza pero no juegan)
+        effective_gap = max(0, 11 - available_count)
+        if effective_gap > 0 and cfg.auto_attack:
+            _ag_log("reinforce", f"XI efectivo {available_count}/11 — buscando {effective_gap} refuerzo(s)", "warning")
+            try:
+                league_raw_r  = await client.get_league_teams()
+                rival_teams_r = [
+                    t for t in _extract_list(league_raw_r)
+                    if (t.get("teamid") or t.get("id")) != client.user_team_id
+                ]
+                now_r = datetime.now(timezone.utc)
+
+                async def _fetch_r2(t):
+                    tid = t.get("teamid") or t.get("id")
+                    try:
+                        return t, _extract_list(await client.get_team_players(team_id=tid))
+                    except Exception:
+                        return t, []
+
+                rosters_r = await asyncio.gather(*[_fetch_r2(t) for t in rival_teams_r])
+                reinforce_pool: list[tuple] = []
+                for team_info_r, roster_r in rosters_r:
+                    for p in roster_r:
+                        pid_r = _get_field(p, "_id", "id")
+                        if pid_r in my_ids_s:
+                            continue
+                        if not _is_available(p):
+                            continue
+                        avg_r   = _avg_per_game(p)
+                        c_price_r = _clause_price(p)
+                        cl_r    = p.get("clause") or {}
+                        if (cl_r.get("transferred", False) if isinstance(cl_r, dict) else False):
+                            continue
+                        if c_price_r <= 0:
+                            continue
+                        if avg_r < cfg.steal_min_avg:
+                            continue
+                        if cfg.steal_max_clause > 0 and c_price_r > cfg.steal_max_clause:
+                            continue
+                        reinforce_pool.append((avg_r, pid_r, p.get("slug"), int(c_price_r), p.get("name", "?"), p.get("role", "?")))
+
+                reinforce_pool.sort(key=lambda x: -x[0])
+                cash_r = await _get_cash(client)
+                signed = 0
+                for avg_r, pid_r, slug_r, c_price_r, name_r, role_r in reinforce_pool[:effective_gap]:
+                    if cash_r - c_price_r < cfg.min_cash_buffer:
+                        _ag_log("reinforce", f"SKIP {name_r} ({c_price_r:,}) — saldo insuficiente", "warning")
+                        continue
+                    try:
+                        resp_r = await client.pay_player_clause(pid_r, str(slug_r), c_price_r)
+                        ans_r  = resp_r.get("answer", {}) if isinstance(resp_r, dict) else {}
+                        if isinstance(ans_r, dict) and ans_r.get("error"):
+                            _ag_log("reinforce", f"Error fichando refuerzo {name_r}: {ans_r.get('code')}", "error")
+                        else:
+                            _ag_log("reinforce", f"REFUERZO FICHADO: {name_r} ({role_r}) avg={avg_r:.1f} por {c_price_r:,}", "ok",
+                                    {"player": name_r, "avg": avg_r, "clause_paid": c_price_r, "cash_after": cash_r - c_price_r})
+                            cash_r -= c_price_r
+                            signed += 1
+                    except Exception as e_r:
+                        _ag_log("reinforce", f"Excepción refuerzo {name_r}: {e_r}", "error")
+                if signed == 0:
+                    _ag_log("reinforce", "Sin candidatos válidos con saldo suficiente para reforzar", "warning")
+            except Exception as e_ref:
+                _ag_log("reinforce", f"Error buscando refuerzos: {e_ref}", "error")
+    except Exception as e:
+        _ag_log("own_unavailable", f"Error comprobando disponibilidad propia: {e}", "error")
+
     # ── 6. Alineación óptima ──────────────────────────────────────────────────
     if cfg.auto_lineup:
         try:
