@@ -2031,10 +2031,9 @@ def _compute_sell_price(value: float, buy_price: float) -> int:
     """
     Precio de venta según la regla de la liga:
       precio = valor_mercado + 50%  (= valor × 1.5)
-    Nunca por debajo del precio de compra para no perder dinero.
     isClause siempre activado por el cliente HTTP.
     """
-    return max(int(value * 1.5), int(buy_price))
+    return int(value * 1.5)
 
 
 def _suggested_clause(player: dict) -> float:
