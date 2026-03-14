@@ -45,7 +45,7 @@ STARTING_BUDGET       = 200_000_000
 MONEY_PER_POINT       = 150_000
 TARGET_PTS_JORNADA    = 90     # objetivo mínimo: 90 pts del XI por jornada
 MIN_AVG_PER_PLAYER    = round(TARGET_PTS_JORNADA / 11, 2)   # ≈ 8.18 pts/j
-MAX_ROSTER_SIZE       = 12
+MAX_ROSTER_SIZE       = 16
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +575,21 @@ def _avg_per_game(player: dict) -> float:
     return round(pts / matches, 4) if matches else 0.0
 
 
+def _last5_avg(player: dict) -> float:
+    """Promedio últimas 5 jornadas (racha). Si no hay datos, usa avg de temporada."""
+    last5 = (player.get("average") or {}).get("averageLastFive")
+    if last5 is not None:
+        return round(float(last5), 4)
+    return _avg_per_game(player)
+
+
+def _lineup_score(player: dict) -> float:
+    """Puntuación para decidir titularidad: 70% racha last5 + 30% media temporada."""
+    last5 = _last5_avg(player)
+    season = _avg_per_game(player)
+    return round(0.7 * last5 + 0.3 * season, 4)
+
+
 def _efficiency(player: dict, cost_key: str) -> float:
     """Puntos medios por jornada por millón de coste. Cuanto mayor, mejor valor."""
     score = _avg_per_game(player)
@@ -739,6 +754,19 @@ def _best_lineup_analysis(players: list[dict], target_apg: float = 150.0) -> dic
     available = [p for p in players if _is_available(p)]
     unavailable = [p for p in players if not _is_available(p)]
 
+    # Si no hay suficientes jugadores disponibles, admitir los del mercado como
+    # última opción para evitar slots vacíos (un -5 fijo es peor que cualquier pts ≥ 0)
+    if len(available) < 11:
+        market_fallback = [
+            p for p in unavailable
+            if isinstance(p.get("market"), dict) and p.get("market", {}).get("inMarket")
+            and _avg_per_game(p) > 0   # descartar porteros/jugadores sin media
+        ]
+        market_fallback.sort(key=_lineup_score, reverse=True)
+        slots_needed = 11 - len(available)
+        available = available + market_fallback[:slots_needed]
+        unavailable = [p for p in unavailable if p not in available]
+
     best: dict | None = None
     best_total = -1.0
 
@@ -752,7 +780,7 @@ def _best_lineup_analysis(players: list[dict], target_apg: float = 150.0) -> dic
         primary_pools = {
             pos: sorted(
                 [p for p in available if _primary_pos(p) == pos],
-                key=_avg_per_game, reverse=True,
+                key=_lineup_score, reverse=True,
             )
             for pos in needed
         }
@@ -770,7 +798,7 @@ def _best_lineup_analysis(players: list[dict], target_apg: float = 150.0) -> dic
             r2_pool = sorted(
                 [p for p in available
                  if _get_field(p, "_id", "id") not in used and _secondary_pos(p) == pos],
-                key=_avg_per_game, reverse=True,
+                key=_lineup_score, reverse=True,
             )
             for p in r2_pool:
                 if len(assignment[pos]) >= n:
@@ -795,6 +823,8 @@ def _best_lineup_analysis(players: list[dict], target_apg: float = 150.0) -> dic
                     summary = _player_summary(p, "lineup")
                     summary["assigned_pos"] = pos
                     summary["avg_per_game"] = _avg_per_game(p)
+                    summary["last5_avg"] = _last5_avg(p)
+                    summary["lineup_score"] = _lineup_score(p)
                     summary["available"] = True
                     summary["availability"] = _availability_label(p)
                     if _primary_pos(p) != pos:
@@ -809,8 +839,8 @@ def _best_lineup_analysis(players: list[dict], target_apg: float = 150.0) -> dic
             }
 
     if best is None:
-        # Fallback: los 11 mejores disponibles por avg_per_game
-        top11 = sorted(available, key=_avg_per_game, reverse=True)[:11]
+        # Fallback: los 11 mejores disponibles por racha
+        top11 = sorted(available, key=_lineup_score, reverse=True)[:11]
         total_apg = sum(_avg_per_game(p) for p in top11)
         best = {
             "formation": "libre",
@@ -1028,10 +1058,12 @@ async def auto_run(body: AutoRunRequest, client: FutmondoClient = Depends(get_cl
         )
         sell_count = max(1, int(len(sorted_mine) * body.sell_bottom_pct))
         # Guardia de portero: nunca vender si es el único GK
-        gk_count = sum(1 for p in my_players if _primary_pos(p) == "GK")
+        gk_count  = sum(1 for p in my_players if _primary_pos(p) == "GK")
+        def_count = sum(1 for p in my_players if _primary_pos(p) == "DEF")
         sell_candidates = [
             p for p in sorted_mine
-            if not (_primary_pos(p) == "GK" and gk_count <= 1)
+            if not (_primary_pos(p) == "GK"  and gk_count  <= 1)   # nunca vender último portero
+            and not (_primary_pos(p) == "DEF" and def_count <= 3)   # nunca vender si quedan ≤3 defensas
             and (body.sell_min_avg == 0 or _avg_per_game(p) < body.sell_min_avg)
         ][:sell_count]
 
@@ -3760,25 +3792,32 @@ def _ag_save_config(cfg: AutoGestioneConfig) -> None:
 # ── Saldo disponible ──────────────────────────────────────────────────────────
 
 async def _get_cash(client: FutmondoClient) -> float:
-    """Devuelve el saldo disponible en la cuenta. Devuelve 0 si no se puede obtener."""
+    """
+    Devuelve el saldo disponible en la cuenta.
+    Futmondo no expone el presupuesto en /user/information, así que
+    si no encontramos valor real devolvemos un valor alto para no
+    bloquear los fichajes: la propia API rechazará con error si no hay saldo.
+    """
     try:
         raw = await client.get_user_info()
         ans = raw.get("answer", raw) if isinstance(raw, dict) else {}
         if isinstance(ans, dict):
-            for key in ("mondos", "money", "balance", "cash", "coins"):
+            for key in ("money", "balance", "cash", "coins", "budget", "teamBudget"):
                 v = ans.get(key)
                 if isinstance(v, (int, float)) and v > 0:
                     return float(v)
             # Puede venir anidado
             for sub in ans.values():
                 if isinstance(sub, dict):
-                    for key in ("mondos", "money", "balance", "cash", "coins"):
+                    for key in ("money", "balance", "cash", "coins", "budget", "teamBudget"):
                         v = sub.get(key)
                         if isinstance(v, (int, float)) and v > 0:
                             return float(v)
     except Exception:
         pass
-    return 0.0
+    # No se puede obtener el saldo — devolver valor alto y dejar que la API de Futmondo
+    # rechace con error si realmente no hay fondos suficientes.
+    return 999_999_999.0
 
 
 # ── Log ───────────────────────────────────────────────────────────────────────
@@ -4108,6 +4147,57 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
         except Exception as e:
             _ag_log("fill_on_stolen", f"Error en relleno urgente: {e}", "error")
 
+    # ── 4c. COMPRA DEL MERCADO ABIERTO ───────────────────────────────────────
+    # Si hay huecos y hay jugadores buenos en el mercado, comprarlos por bid
+    if cfg.fill_on_stolen or cfg.auto_attack:
+        try:
+            my_raw_m = await client.get_team_players()
+            my_players_m = _extract_list(my_raw_m)
+            free_m = max(0, MAX_ROSTER_SIZE - len(my_players_m))
+            if free_m > 0:
+                market_raw = await client.get_market()
+                market_players = _extract_list(market_raw)
+                my_ids_m = {_get_field(p, "_id", "id") for p in my_players_m}
+                cash_m = await _get_cash(client)
+
+                # Candidatos del mercado con avg >= fill_fallback_min_avg
+                mkt_candidates = []
+                for p in market_players:
+                    pid_m = _get_field(p, "_id", "id")
+                    if pid_m in my_ids_m:
+                        continue
+                    avg_m   = _last5_avg(p)   # priorizar racha
+                    price_m = float(p.get("price") or p.get("value") or 0)
+                    if avg_m < cfg.fill_fallback_min_avg or price_m <= 0:
+                        continue
+                    if cfg.steal_max_clause > 0 and price_m > cfg.steal_max_clause:
+                        continue
+                    if not _is_available(p):
+                        continue
+                    mkt_candidates.append((avg_m, pid_m, p.get("slug"), int(price_m), p.get("name", "?")))
+
+                mkt_candidates.sort(key=lambda x: -x[0])
+                mkt_bought = 0
+                for avg_m, pid_m, slug_m, price_m, name_m in mkt_candidates:
+                    if mkt_bought >= free_m:
+                        break
+                    if cash_m - price_m < cfg.min_cash_buffer:
+                        _ag_log("market_buy", f"SKIP {name_m} ({price_m:,}) — saldo insuficiente", "warning")
+                        continue
+                    try:
+                        resp_m = await client.set_bid(pid_m, str(slug_m), price_m)
+                        ans_m  = resp_m.get("answer", {}) if isinstance(resp_m, dict) else {}
+                        if isinstance(ans_m, dict) and ans_m.get("error"):
+                            _ag_log("market_buy", f"Error comprando {name_m}: {ans_m.get('code')}", "error")
+                        else:
+                            _ag_log("market_buy", f"COMPRADO del mercado: {name_m} last5={avg_m:.2f} por {price_m:,}", "ok")
+                            cash_m -= price_m
+                            mkt_bought += 1
+                    except Exception as e_m:
+                        _ag_log("market_buy", f"Excepción comprando {name_m}: {e_m}", "error")
+        except Exception as e:
+            _ag_log("market_buy", f"Error general en compra de mercado: {e}", "error")
+
     # ── 5. Monitor de anomalías y cláusulas ──────────────────────────────────
     try:
         report = await _collect_anomalies(client)
@@ -4162,9 +4252,10 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
         if effective_gap > 0 and cfg.auto_attack:
             _ag_log("reinforce", f"XI efectivo {available_count}/11 — buscando {effective_gap} refuerzo(s)", "warning")
             try:
-                league_raw_r  = await client.get_league_teams()
+                champ_raw_r   = await client.get_championship_info()
+                inner_r       = champ_raw_r.get("answer", champ_raw_r) if isinstance(champ_raw_r, dict) else {}
                 rival_teams_r = [
-                    t for t in _extract_list(league_raw_r)
+                    t for t in (inner_r.get("teams", []) if isinstance(inner_r, dict) else [])
                     if (t.get("teamid") or t.get("id")) != client.user_team_id
                 ]
                 now_r = datetime.now(timezone.utc)
