@@ -2609,6 +2609,13 @@ def _is_available(player: dict) -> bool:
     Los valores 0/False/None se consideran DISPONIBLE.
     Los valores ≥ 2 en status numérico se consideran NO DISPONIBLE.
     """
+    # Jugador en el mercado de venta → no puede puntuar en la jornada
+    market = player.get("market")
+    if isinstance(market, dict) and market.get("inMarket"):
+        return False
+    if isinstance(market, bool) and market:
+        return False
+
     # Campo booleano / entero activo
     active = player.get("active")
     if active is not None and not active:
