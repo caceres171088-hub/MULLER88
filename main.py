@@ -1754,7 +1754,7 @@ async def war_room(
     roster_size   = len(my_players)
     on_market_cnt = sum(1 for p in my_players if p.get("market"))
     active_cnt    = roster_size - on_market_cnt
-    free_slots    = max(0, 12 - roster_size)
+    free_slots    = max(0, MAX_ROSTER_SIZE - roster_size)
     xi            = _best_lineup_analysis(my_players, TARGET_PTS_JORNADA)
 
     # ── Datos rivales ──────────────────────────────────────────────────────────
@@ -2935,12 +2935,12 @@ async def execute_attack(
     my_players = _extract_list(my_raw)
     on_market  = sum(1 for p in my_players if p.get("market"))
     active_cnt = len(my_players) - on_market
-    free_slots = max(0, 12 - len(my_players))
+    free_slots = max(0, MAX_ROSTER_SIZE - len(my_players))
 
     if free_slots == 0 and not dry_run:
         return {
             "status":    "roster_full",
-            "message":   f"Roster lleno ({len(my_players)}/12 jugadores, {on_market} en venta). Espera a que expiren listings.",
+            "message":   f"Roster lleno ({len(my_players)}/{MAX_ROSTER_SIZE} jugadores, {on_market} en venta). Espera a que expiren listings.",
             "free_slots": 0,
             "dry_run":   dry_run,
         }
@@ -3276,7 +3276,7 @@ async def auto_play(
     )
     my_players = _extract_list(team_raw)
     on_market  = sum(1 for p in my_players if p.get("market"))
-    free_slots = max(0, 12 - len(my_players))
+    free_slots = max(0, MAX_ROSTER_SIZE - len(my_players))
 
     inner       = champ_raw.get("answer", champ_raw) if isinstance(champ_raw, dict) else {}
     champ_teams = inner.get("teams", []) if isinstance(inner, dict) else []
@@ -3815,9 +3815,26 @@ async def _get_cash(client: FutmondoClient) -> float:
                             return float(v)
     except Exception:
         pass
-    # No se puede obtener el saldo — devolver valor alto y dejar que la API de Futmondo
-    # rechace con error si realmente no hay fondos suficientes.
-    return 999_999_999.0
+    # No se puede obtener el saldo de la API — estimar con:
+    # cash ≈ budget_inicial + puntos×150k - sum(buyPrices plantilla actual)
+    # Esta estimación ignora ventas previas, pero evita intentar compras imposibles.
+    try:
+        team_raw = await client.get_team_players()
+        squad = _extract_list(team_raw)
+        pts_raw = await client.get_championship_info()
+        pts_inner = pts_raw.get("answer", pts_raw) if isinstance(pts_raw, dict) else {}
+        my_pts = 0.0
+        teams = pts_inner.get("teams", []) if isinstance(pts_inner, dict) else []
+        for t in teams:
+            if (t.get("teamid") or t.get("id")) == client.user_team_id:
+                my_pts = float(t.get("points", 0))
+                break
+        total_invested = sum(float(p.get("buyPrice") or 0) for p in squad)
+        estimated = STARTING_BUDGET + my_pts * MONEY_PER_POINT - total_invested
+        return max(0.0, estimated)
+    except Exception:
+        pass
+    return 0.0
 
 
 # ── Log ───────────────────────────────────────────────────────────────────────
@@ -4002,8 +4019,18 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
                         break
                     # Control de saldo: no robar si deja el saldo por debajo del buffer
                     if cash - c_price < cfg.min_cash_buffer:
-                        _ag_log("steal", f"SKIP {name} ({c_price:,}) — saldo insuficiente "
-                                f"(disponible={cash:,.0f}, reserva={cfg.min_cash_buffer:,.0f})", "warning")
+                        # Añadir a la cola de snipe para disparar en el último segundo de la cláusula
+                        existing = {f["player_id"] for f in _read_fichajes()}
+                        if pid not in existing:
+                            _write_fichajes(_read_fichajes() + [{
+                                "player_id": pid, "player_slug": str(slug),
+                                "price": c_price, "name": name,
+                                "team_id": None,
+                            }])
+                            _ag_log("steal", f"COLA SNIPE: {name} ({c_price:,}) — saldo insuficiente, "
+                                    f"programado para disparo en expiración", "warning")
+                        else:
+                            _ag_log("steal", f"SKIP {name} — ya en cola snipe", "info")
                         continue
                     try:
                         resp = await client.pay_player_clause(pid, str(slug), c_price)
@@ -4120,8 +4147,17 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
                         break
                     # Control de saldo también en relleno urgente
                     if cash_fill - c_price_f < cfg.min_cash_buffer:
-                        _ag_log("fill_gap", f"SKIP {name_f} ({c_price_f:,}) — saldo insuficiente "
-                                f"(disponible={cash_fill:,.0f}, reserva={cfg.min_cash_buffer:,.0f})", "warning")
+                        existing_f = {f["player_id"] for f in _read_fichajes()}
+                        if pid_f not in existing_f:
+                            _write_fichajes(_read_fichajes() + [{
+                                "player_id": pid_f, "player_slug": str(slug_f),
+                                "price": c_price_f, "name": name_f,
+                                "team_id": None,
+                            }])
+                            _ag_log("fill_gap", f"COLA SNIPE: {name_f} ({c_price_f:,}) — sin saldo, "
+                                    f"programado para disparo en expiración", "warning")
+                        else:
+                            _ag_log("fill_gap", f"SKIP {name_f} — ya en cola snipe", "info")
                         continue
                     try:
                         resp_f = await client.pay_player_clause(pid_f, str(slug_f), c_price_f)
