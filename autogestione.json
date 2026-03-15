@@ -1,5 +1,5 @@
 {
-  "enabled": false,
+  "enabled": true,
   "check_interval_minutes": 5,
   "auto_sell": false,
   "sell_bottom_pct": 0.2,
