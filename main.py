@@ -3831,10 +3831,15 @@ async def _get_cash(client: FutmondoClient) -> float:
                 break
         total_invested = sum(float(p.get("buyPrice") or 0) for p in squad)
         estimated = STARTING_BUDGET + my_pts * MONEY_PER_POINT - total_invested
-        return max(0.0, estimated)
+        if estimated <= 0:
+            # La estimación ignora ventas pasadas y puede ser negativa en equipos
+            # con historial de transacciones. Devolvemos un valor alto para no
+            # bloquear al agente: la propia API de Futmondo rechazará si no hay fondos.
+            return 999_000_000.0
+        return estimated
     except Exception:
         pass
-    return 0.0
+    return 999_000_000.0
 
 
 # ── Log ───────────────────────────────────────────────────────────────────────
