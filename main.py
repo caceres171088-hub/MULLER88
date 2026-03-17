@@ -18,6 +18,7 @@ Endpoints disponibles:
   GET  /strategy                  - Recomendaciones: vender, comprar, robar
   GET  /strategy/speculate        - Oportunidades de especulación en el mercado
   GET  /strategy/lineup           - XI óptimo para máximos puntos por jornada
+  GET  /strategy/star             - Identificar estrella del equipo y estrellas fichables en rivales
   POST /auto/run                  - Piloto automático: vende, especula y roba sin intervención
 """
 
@@ -943,6 +944,138 @@ async def speculate(
             "shown": min(top, len(deals)),
             "deals": deals[:top],
         }
+    except Exception as exc:
+        _handle_error(exc)
+
+
+@app.get("/strategy/star", tags=["Estrategia"])
+async def strategy_star(
+    scan_rivals: bool = Query(True, description="Escanear equipos rivales en busca de estrellas fichables"),
+    star_max_clause: float = Query(0.0, ge=0.0, description="Presupuesto máximo para una estrella rival (0 = sin límite)"),
+    client: FutmondoClient = Depends(get_client),
+):
+    """
+    **Estrategia de equipo centrado en una estrella.**
+
+    Devuelve:
+    - `my_star`: el jugador más valioso de tu equipo actual (protegido, nunca vender)
+    - `my_squad_value`: valor total de la plantilla
+    - `star_pct_of_squad`: qué % del valor total representa la estrella
+    - `rival_star_targets`: estrellas fichables en equipos rivales, ordenadas por valor de mercado
+    - `recommendation`: consejo de acción (mantener, buscar estrella más cara, etc.)
+    """
+    try:
+        team_data  = await client.get_team_players()
+        my_players = _extract_list(team_data)
+        if not my_players:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No hay jugadores en el equipo")
+
+        # Identificar la estrella actual (jugador más caro del equipo)
+        my_players_sorted = sorted(
+            my_players,
+            key=lambda p: float(_get_field(p, "value", "marketValue") or 0),
+            reverse=True,
+        )
+        my_star   = my_players_sorted[0]
+        star_value = float(_get_field(my_star, "value", "marketValue") or 0)
+        squad_value = sum(float(_get_field(p, "value", "marketValue") or 0) for p in my_players)
+        star_pct    = round(star_value / squad_value * 100, 1) if squad_value > 0 else 0.0
+
+        result: dict = {
+            "my_star": {
+                "id":       _get_field(my_star, "_id", "id"),
+                "name":     my_star.get("name", "?"),
+                "role":     my_star.get("role", "?"),
+                "value":    int(star_value),
+                "avg_per_game": round(_avg_per_game(my_star), 2),
+                "protected": True,
+            },
+            "my_squad_value":    int(squad_value),
+            "star_pct_of_squad": star_pct,
+            "rival_star_targets": [],
+            "recommendation": "",
+        }
+
+        # Consejo básico según concentración de valor
+        if star_pct < 20:
+            result["recommendation"] = (
+                "Tu plantilla es muy equilibrada — considera invertir más en una sola estrella de alto impacto."
+            )
+        elif star_pct > 50:
+            result["recommendation"] = (
+                f"{my_star.get('name','?')} ya domina el equipo ({star_pct}% del valor). "
+                "Mantén a tu estrella y complementa con jugadores eficientes baratos."
+            )
+        else:
+            result["recommendation"] = (
+                f"{my_star.get('name','?')} es tu estrella actual ({star_pct}% del valor). "
+                "Buen equilibrio — protégela y busca upgrade si hay una estrella rival accesible."
+            )
+
+        # Escanear rivales en busca de estrellas fichables
+        if scan_rivals:
+            champ_raw   = await client.get_championship_info()
+            inner       = champ_raw.get("answer", champ_raw) if isinstance(champ_raw, dict) else {}
+            rival_teams = [
+                t for t in (inner.get("teams", []) if isinstance(inner, dict) else [])
+                if (t.get("teamid") or t.get("id")) != client.user_team_id
+            ]
+            my_ids = {_get_field(p, "_id", "id") for p in my_players}
+
+            async def _fetch_rival(t):
+                tid = t.get("teamid") or t.get("id")
+                try:
+                    return t, _extract_list(await client.get_team_players(team_id=tid))
+                except Exception:
+                    return t, []
+
+            all_rosters = await asyncio.gather(*[_fetch_rival(t) for t in rival_teams])
+            star_targets = []
+            for team_info, roster in all_rosters:
+                team_name = team_info.get("teamname") or team_info.get("name", "?")
+                if not roster:
+                    continue
+                # La estrella del rival = su jugador más caro
+                rival_star = max(roster, key=lambda p: float(_get_field(p, "value", "marketValue") or 0))
+                pid        = _get_field(rival_star, "_id", "id")
+                if pid in my_ids:
+                    continue
+                r_value   = float(_get_field(rival_star, "value", "marketValue") or 0)
+                c_price   = _clause_price(rival_star)
+                cl        = rival_star.get("clause") or {}
+                transferred = cl.get("transferred", False) if isinstance(cl, dict) else False
+                if transferred or c_price <= 0:
+                    continue
+                if star_max_clause > 0 and c_price > star_max_clause:
+                    continue
+                if not _is_available(rival_star):
+                    continue
+                star_targets.append({
+                    "id":           pid,
+                    "name":         rival_star.get("name", "?"),
+                    "role":         rival_star.get("role", "?"),
+                    "team":         team_name,
+                    "value":        int(r_value),
+                    "clause_price": int(c_price),
+                    "avg_per_game": round(_avg_per_game(rival_star), 2),
+                    "value_vs_my_star": round((r_value - star_value) / max(star_value, 1) * 100, 1),
+                })
+
+            # Ordenar por valor descendente
+            star_targets.sort(key=lambda x: -x["value"])
+            result["rival_star_targets"] = star_targets[:10]
+
+            if star_targets and star_targets[0]["value"] > star_value * 1.15:
+                best = star_targets[0]
+                result["recommendation"] += (
+                    f" ★ UPGRADE DISPONIBLE: {best['name']} ({best['team']}) "
+                    f"vale {best['value']:,} (+{best['value_vs_my_star']}%) — cláusula: {best['clause_price']:,}."
+                )
+
+        return result
+
+    except HTTPException:
+        raise
     except Exception as exc:
         _handle_error(exc)
 
@@ -3772,6 +3905,12 @@ class AutoGestioneConfig(BaseModel):
     auto_lineup:     bool  = Field(True, description="Calcular y aplicar alineación óptima en cada ciclo")
     target_pts_jornada: float = Field(float(TARGET_PTS_JORNADA), ge=1.0,
         description="Objetivo de puntos/jornada del XI para la alineación óptima")
+    # ── Estrategia de estrella ─────────────────────────────────────────────
+    star_player_id:    str | None = Field(None, description="ID del jugador estrella — intocable, nunca se vende")
+    auto_protect_star: bool       = Field(True,  description="Proteger automáticamente al jugador más valioso del equipo")
+    star_max_clause:   float      = Field(0.0, ge=0.0,
+        description="Presupuesto máximo para fichar una estrella rival (0 = usar steal_max_clause normal). "
+                    "Permite superar steal_max_clause para objetivos de alto valor")
 
 
 # ── Persistencia de config ─────────────────────────────────────────────────────
@@ -3910,12 +4049,21 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
             active     = [p for p in my_players if not p.get("market")]
             gk_count   = sum(1 for p in active if p.get("role", "").lower() == "portero")
 
+            # Determinar la estrella protegida: star_player_id explícito o el más caro del equipo
+            star_id: str | None = cfg.star_player_id
+            if not star_id and cfg.auto_protect_star and active:
+                star_id = _get_field(
+                    max(active, key=lambda p: float(_get_field(p, "value", "marketValue") or 0)),
+                    "_id", "id",
+                )
+
             sorted_by_eff = sorted(active, key=lambda p: float(p.get("change") or 0))
             sell_count    = max(1, int(len(sorted_by_eff) * cfg.sell_bottom_pct))
             candidates    = [
                 p for p in sorted_by_eff
                 if not (p.get("role", "").lower() == "portero" and gk_count <= 1)
                 and (cfg.sell_min_avg == 0 or _avg_per_game(p) < cfg.sell_min_avg)
+                and _get_field(p, "_id", "id") != star_id   # ★ nunca vender la estrella
             ][:sell_count]
 
             for p in candidates:
@@ -4002,12 +4150,21 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
                             continue
                         if avg < cfg.steal_min_avg:
                             continue
-                        if cfg.steal_max_clause > 0 and c_price > cfg.steal_max_clause:
+
+                        # Determinar límite de cláusula: los jugadores de alto valor pueden usar star_max_clause
+                        is_star_target = (
+                            cfg.star_max_clause > 0
+                            and c_price > cfg.steal_max_clause
+                            and c_price <= cfg.star_max_clause
+                        )
+                        if cfg.steal_max_clause > 0 and c_price > cfg.steal_max_clause and not is_star_target:
                             continue
 
-                        # Prioridad = máximos puntos (avg) > portero único > confiado
+                        # Prioridad = máximos puntos (avg) > estrella > portero único > confiado
                         # La cláusula solo desempata (no penaliza fuerte)
                         prio = avg * 100   # avg es el factor dominante (máx puntos)
+                        if is_star_target:
+                            prio += 5000   # ★ boost máximo para candidatos a estrella
                         if role == "portero" and only_one_gk and cfg.prefer_gk:
                             prio += 1000
                         if confiado:

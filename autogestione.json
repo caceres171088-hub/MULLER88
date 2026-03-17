@@ -19,5 +19,8 @@
   "fill_on_stolen": true,
   "fill_fallback_min_avg": 4.5,
   "auto_lineup": true,
-  "target_pts_jornada": 120.0
+  "target_pts_jornada": 120.0,
+  "star_player_id": null,
+  "auto_protect_star": true,
+  "star_max_clause": 200000000.0
 }
