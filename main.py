@@ -4604,43 +4604,55 @@ async def _sniper_watcher(client: FutmondoClient, cfg: AutoGestioneConfig) -> No
     Tarea paralela que vigila la lista de fichajes y programa un snipe por cada
     jugador con fecha de expiración de cláusula conocida.
     Comprueba la lista cada minuto y evita programar el mismo jugador dos veces.
+    Las consultas a la API se hacen en paralelo para no bloquear el bucle.
     """
     scheduled: dict[str, asyncio.Task] = {}
 
+    async def _resolve_expiry(item: dict) -> tuple[str, "datetime | None"]:
+        """Resuelve la fecha de expiración de cláusula para un jugador (con timeout propio)."""
+        pid = item["player_id"]
+        expiry: datetime | None = None
+        try:
+            pdata = await asyncio.wait_for(client.get_player_data(pid), timeout=10.0)
+            candidate = pdata
+            if isinstance(pdata, dict) and "answer" in pdata:
+                ans = pdata["answer"]
+                candidate = ans if isinstance(ans, dict) else pdata
+            expiry = _clause_expiry(candidate)
+        except Exception:
+            pass
+
+        if expiry is None and item.get("team_id"):
+            try:
+                roster_raw = await asyncio.wait_for(
+                    client.get_team_players(team_id=item["team_id"]), timeout=10.0
+                )
+                for p in _extract_list(roster_raw):
+                    if _get_field(p, "_id", "id") == pid or str(p.get("slug")) == item["player_slug"]:
+                        expiry = _clause_expiry(p)
+                        break
+            except Exception:
+                pass
+
+        return pid, expiry
+
     while True:
         try:
-            for item in _read_fichajes():
-                pid = item["player_id"]
-                # Si ya hay una tarea viva para este jugador, saltar
-                if pid in scheduled and not scheduled[pid].done():
-                    continue
+            fichajes = _read_fichajes()
+            pending = [item for item in fichajes if item["player_id"] not in scheduled or scheduled[item["player_id"]].done()]
 
-                expiry: datetime | None = None
-                try:
-                    pdata     = await client.get_player_data(pid)
-                    candidate = pdata
-                    if isinstance(pdata, dict) and "answer" in pdata:
-                        ans       = pdata["answer"]
-                        candidate = ans if isinstance(ans, dict) else pdata
-                    expiry = _clause_expiry(candidate)
-                except Exception:
-                    pass
-
-                if expiry is None and item.get("team_id"):
-                    try:
-                        roster_raw = await client.get_team_players(team_id=item["team_id"])
-                        for p in _extract_list(roster_raw):
-                            if _get_field(p, "_id", "id") == pid or str(p.get("slug")) == item["player_slug"]:
-                                expiry = _clause_expiry(p)
-                                break
-                    except Exception:
-                        pass
-
-                if expiry:
-                    seconds_left = (expiry - datetime.now(timezone.utc)).total_seconds()
-                    if seconds_left > 0:
-                        task = asyncio.create_task(_execute_snipe_ag(client, item, expiry, cfg))
-                        scheduled[pid] = task
+            if pending:
+                results = await asyncio.gather(*[_resolve_expiry(item) for item in pending], return_exceptions=True)
+                item_by_pid = {item["player_id"]: item for item in pending}
+                for res in results:
+                    if isinstance(res, Exception):
+                        continue
+                    pid, expiry = res
+                    if expiry:
+                        seconds_left = (expiry - datetime.now(timezone.utc)).total_seconds()
+                        if seconds_left > 0:
+                            task = asyncio.create_task(_execute_snipe_ag(client, item_by_pid[pid], expiry, cfg))
+                            scheduled[pid] = task
 
             # Limpiar tareas terminadas
             for pid in [k for k, v in scheduled.items() if v.done()]:
