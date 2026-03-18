@@ -33,6 +33,7 @@ ENDPOINTS = {
     "SET_BID": "/1/market/bid",
     "MODIFY_BID": "/5/market/modifybid",
     "GET_TEAM_PLAYERS": "/1/userteam/roster",
+    "USERTEAM_INFORMATION": "/1/userteam/information",
     "PRESSROOM": "/1/locker/pressroom",
     "DIRECT_SELL": "/1/market/directsell",
     # Alineación
@@ -157,6 +158,10 @@ class FutmondoClient:
     async def get_user_info(self) -> dict:
         """Obtiene información del usuario: saldo de coins, estadísticas, etc."""
         return await self._post("USER_INFORMATION")
+
+    async def get_userteam_info(self) -> dict:
+        """Obtiene información del equipo: presupuesto, valor, límite de puja, etc."""
+        return await self._post("USERTEAM_INFORMATION")
 
     async def get_market(self) -> dict:
         """Obtiene los jugadores disponibles en el mercado."""

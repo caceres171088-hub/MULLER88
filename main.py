@@ -522,7 +522,7 @@ async def get_budget(client: FutmondoClient = Depends(get_client)):
     Úsalo para saber cuánto dinero tienes para fichar y cuánto margen salarial te queda.
     """
     try:
-        return await client.get_user_info()
+        return await client.get_userteam_info()
     except Exception as exc:
         _handle_error(exc)
 
@@ -3933,10 +3933,19 @@ def _ag_save_config(cfg: AutoGestioneConfig) -> None:
 async def _get_cash(client: FutmondoClient) -> float:
     """
     Devuelve el saldo disponible en la cuenta.
-    Futmondo no expone el presupuesto en /user/information, así que
-    si no encontramos valor real devolvemos un valor alto para no
-    bloquear los fichajes: la propia API rechazará con error si no hay saldo.
+    El presupuesto real está en /1/userteam/information (campo 'budget').
     """
+    try:
+        raw = await client.get_userteam_info()
+        ans = raw.get("answer", raw) if isinstance(raw, dict) else {}
+        if isinstance(ans, dict):
+            for key in ("budget", "money", "balance", "cash", "teamBudget"):
+                v = ans.get(key)
+                if isinstance(v, (int, float)) and v > 0:
+                    return float(v)
+    except Exception:
+        pass
+    # Fallback: /user/information (no tiene campos monetarios, pero por si acaso)
     try:
         raw = await client.get_user_info()
         ans = raw.get("answer", raw) if isinstance(raw, dict) else {}
@@ -3945,13 +3954,6 @@ async def _get_cash(client: FutmondoClient) -> float:
                 v = ans.get(key)
                 if isinstance(v, (int, float)) and v > 0:
                     return float(v)
-            # Puede venir anidado
-            for sub in ans.values():
-                if isinstance(sub, dict):
-                    for key in ("money", "balance", "cash", "coins", "budget", "teamBudget"):
-                        v = sub.get(key)
-                        if isinstance(v, (int, float)) and v > 0:
-                            return float(v)
     except Exception:
         pass
     # No se puede obtener el saldo de la API — estimar con:
