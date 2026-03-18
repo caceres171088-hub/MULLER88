@@ -3882,7 +3882,7 @@ class AutoGestioneConfig(BaseModel):
     sell_min_avg:      float = Field(MIN_AVG_PER_PLAYER, ge=0.0, description="Proteger jugadores con avg ≥ este valor")
     # ── Robos por cláusula ─────────────────────────────────────────────────
     auto_attack:      bool  = Field(True,  description="Robar jugadores rivales automáticamente")
-    steal_top:        int   = Field(2, ge=0, le=5, description="Máximo de robos por ciclo")
+    steal_top:        int   = Field(2, ge=0, le=16, description="Máximo de robos por ciclo")
     steal_min_avg:    float = Field(MIN_AVG_PER_PLAYER, ge=0.0, description="Media mínima del objetivo (default: 90pts/11j ≈ 8.18)")
     steal_max_clause: float = Field(0.0,  ge=0.0, description="Cláusula máxima a pagar (0 = sin límite)")
     prefer_gk:        bool  = Field(True,  description="Priorizar portero único rival (máximo daño)")
@@ -3893,7 +3893,7 @@ class AutoGestioneConfig(BaseModel):
     # ── Sniper de fichajes ─────────────────────────────────────────────────
     auto_snipe:      bool = Field(True,  description="Disparar la lista de fichajes en el último segundo")
     snipe_seconds:   int  = Field(10,  ge=3, le=120, description="Segundos antes de expirar en que se dispara")
-    snipe_retries:   int  = Field(5,   ge=1, le=20,  description="Reintentos tras el disparo del snipe")
+    snipe_retries:   int  = Field(5,   ge=1, le=60,  description="Reintentos tras el disparo del snipe")
     # ── Control de saldo ────────────────────────────────────────────────────
     min_cash_buffer: float = Field(5_000_000, ge=0,
         description="Saldo mínimo a mantener siempre — nunca gastar si dejaría el saldo por debajo de esta cifra")
@@ -4059,36 +4059,40 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
                     "_id", "id",
                 )
 
-            sorted_by_eff = sorted(active, key=lambda p: float(p.get("change") or 0))
-            sell_count    = max(1, int(len(sorted_by_eff) * cfg.sell_bottom_pct))
-            candidates    = [
-                p for p in sorted_by_eff
-                if not (p.get("role", "").lower() == "portero" and gk_count <= 1)
-                and (cfg.sell_min_avg == 0 or _avg_per_game(p) < cfg.sell_min_avg)
-                and _get_field(p, "_id", "id") != star_id   # ★ nunca vender la estrella
-            ][:sell_count]
+            # Nunca vender si no hay suficientes activos para completar el XI
+            if len(active) <= 11:
+                _ag_log("auto_sell", f"Solo {len(active)} jugadores activos — venta suspendida para no romper el XI", "warning")
+            else:
+                sorted_by_eff = sorted(active, key=lambda p: float(p.get("change") or 0))
+                sell_count    = max(1, int(len(sorted_by_eff) * cfg.sell_bottom_pct))
+                candidates    = [
+                    p for p in sorted_by_eff
+                    if not (p.get("role", "").lower() == "portero" and gk_count <= 1)
+                    and (cfg.sell_min_avg == 0 or _avg_per_game(p) < cfg.sell_min_avg)
+                    and _get_field(p, "_id", "id") != star_id   # ★ nunca vender la estrella
+                ][:sell_count]
 
-            for p in candidates:
-                pid   = _get_field(p, "_id", "id")
-                slug  = p.get("slug")
-                value = float(_get_field(p, "value", "marketValue") or 0)
-                buy_p = float(p.get("buyPrice") or 0)
-                price = _compute_sell_price(value, buy_p)
-                # Intentar venta directa primero
-                try:
-                    direct = await client.direct_sell(pid, str(slug))
-                    d_ans  = direct.get("answer", {}) if isinstance(direct, dict) else {}
-                    if isinstance(d_ans, dict) and not d_ans.get("error"):
-                        _ag_log("sell", f"Venta directa: {p.get('name','?')} avg={_avg_per_game(p):.2f}/j", "ok")
-                        continue
-                except Exception:
-                    pass
-                # Fallback: listing en el mercado
-                try:
-                    await client.set_player_in_market(pid, str(slug), price)
-                    _ag_log("sell", f"Mercado: {p.get('name','?')} a {price:,}", "ok")
-                except Exception as e:
-                    _ag_log("sell", f"Error vendiendo {p.get('name','?')}: {e}", "error")
+                for p in candidates:
+                    pid   = _get_field(p, "_id", "id")
+                    slug  = p.get("slug")
+                    value = float(_get_field(p, "value", "marketValue") or 0)
+                    buy_p = float(p.get("buyPrice") or 0)
+                    price = _compute_sell_price(value, buy_p)
+                    # Intentar venta directa primero
+                    try:
+                        direct = await client.direct_sell(pid, str(slug))
+                        d_ans  = direct.get("answer", {}) if isinstance(direct, dict) else {}
+                        if isinstance(d_ans, dict) and not d_ans.get("error"):
+                            _ag_log("sell", f"Venta directa: {p.get('name','?')} avg={_avg_per_game(p):.2f}/j", "ok")
+                            continue
+                    except Exception:
+                        pass
+                    # Fallback: listing en el mercado
+                    try:
+                        await client.set_player_in_market(pid, str(slug), price)
+                        _ag_log("sell", f"Mercado: {p.get('name','?')} a {price:,}", "ok")
+                    except Exception as e:
+                        _ag_log("sell", f"Error vendiendo {p.get('name','?')}: {e}", "error")
         except Exception as e:
             _ag_log("auto_sell", f"Error general: {e}", "error")
 
@@ -4366,7 +4370,8 @@ async def _ag_cycle(client: FutmondoClient, cfg: AutoGestioneConfig) -> None:
                     pid_m = _get_field(p, "_id", "id")
                     if pid_m in my_ids_m:
                         continue
-                    avg_m   = _last5_avg(p)   # priorizar racha
+                    # Usar la mejor de las dos medias para no descartar jugadores con last5=0 pero buena temporada
+                    avg_m   = max(_last5_avg(p), _avg_per_game(p))
                     price_m = float(p.get("price") or p.get("value") or 0)
                     if avg_m < cfg.fill_fallback_min_avg or price_m <= 0:
                         continue
