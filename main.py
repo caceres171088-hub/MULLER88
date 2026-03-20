@@ -3703,7 +3703,7 @@ async def _fire_one_clause(
                 return True, None
             err = ans.get("code", "unknown") if isinstance(ans, dict) else "unknown"
             last_err = err
-            if err in ("api.market.max_number_players_in_roster", "api.error.not_found"):
+            if err in ("api.market.max_number_players_in_roster",):
                 return False, err  # error fatal, no reintentar
         except Exception as exc:
             last_err = str(exc)
@@ -3714,9 +3714,9 @@ async def _fire_one_clause(
 
 @app.post("/market/fichajes/fire", tags=["Fichajes"])
 async def fire_fichajes(
-    retries: int = Query(20, ge=1, le=50,
+    retries: int = Query(20, ge=1, le=500,
         description="Veces que se reintenta cada cláusula (default 20, como en bots de medianoche)"),
-    sleep_ms: int = Query(200, ge=50, le=2000,
+    sleep_ms: int = Query(200, ge=50, le=15000,
         description="Milisegundos entre intentos (default 200 ms)"),
     clear_on_success: bool = Query(True,
         description="Eliminar de la lista los jugadores fichados con éxito"),
