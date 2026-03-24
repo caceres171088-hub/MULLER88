@@ -1,0 +1,156 @@
+[
+  {
+    "player_id": "6150ac3c7d1deb0894919f9c",
+    "player_slug": "67276474",
+    "price": 14734051,
+    "name": "Turrientes",
+    "team_id": "64ae4b2419597379af1c7c69"
+  },
+  {
+    "player_id": "65ac4fa5fa23880455a78f95",
+    "player_slug": "86080170",
+    "price": 20453398,
+    "name": "Aramburu",
+    "team_id": "64ae7f9b9b8c8779c4df4c83"
+  },
+  {
+    "player_id": "521465c2dbf8b74f020000b8",
+    "player_slug": "67035000",
+    "price": 18575095,
+    "name": "Yuri",
+    "team_id": "66a937e602b0cb6f20d79785"
+  },
+  {
+    "player_id": "56ff01f1f4bbe2a5799eb126",
+    "player_slug": "67065538",
+    "price": 23506973,
+    "name": "Kike García",
+    "team_id": "64b420d133e50879a9cc9200"
+  },
+  {
+    "player_id": "5df6b2179cb8ff03f65a7529",
+    "player_slug": "49048461",
+    "price": 15082769,
+    "name": "Agoumé",
+    "team_id": "66a941725cba6c6f14abe93f"
+  },
+  {
+    "player_id": "695a877f1b6b9103c47320ef",
+    "player_slug": "2000161876",
+    "price": 10648717,
+    "name": "Tunde",
+    "team_id": "64ae5a68c0abd079d7741f46"
+  },
+  {
+    "player_id": "53df365ce5c94c6a08000203",
+    "player_slug": "67063051",
+    "price": 8208972,
+    "name": "Kiko Femenía",
+    "team_id": "66a941725cba6c6f14abe93f"
+  },
+  {
+    "player_id": "6595c864840719702ac42c2a",
+    "player_slug": "2000052525",
+    "price": 6234820,
+    "name": "Hugo Álvarez",
+    "team_id": "6874064aa81e2e76019c83e1"
+  },
+  {
+    "player_id": "60b40cb9d2d7f04662cc9c19",
+    "player_slug": "2000049425",
+    "price": 11571481,
+    "name": "Omar",
+    "team_id": "66a937e602b0cb6f20d79785"
+  },
+  {
+    "player_id": "5c03bd490f4a903b890cd3da",
+    "player_slug": "48037162",
+    "price": 8400000,
+    "name": "Le Normand",
+    "team_id": "64ae7f9b9b8c8779c4df4c83"
+  },
+  {
+    "player_id": "649947362aef631e6a76de32",
+    "player_slug": "59130428",
+    "price": 6962441,
+    "name": "Sibo",
+    "team_id": "64ae45995b1a1779b5d04efb"
+  },
+  {
+    "player_id": "5676df0e008eb5c93e62f205",
+    "player_slug": "43195181",
+    "price": 10216198,
+    "name": "Sadiq Umar",
+    "team_id": "64b420d133e50879a9cc9200"
+  },
+  {
+    "player_id": "65bc2755a3176a0e0fdba9e1",
+    "player_slug": "34009930",
+    "price": 4615130,
+    "name": "Bakambu",
+    "team_id": "66a937e602b0cb6f20d79785"
+  },
+  {
+    "player_id": "5218979184abda6d26000258",
+    "player_slug": "47022611",
+    "price": 19830747,
+    "name": "Dimitrievski",
+    "team_id": null
+  },
+  {
+    "player_id": "61efea4ec6dfbe0a4fa10b18",
+    "player_slug": "98033710",
+    "price": 13861415,
+    "name": "Eray Cömert",
+    "team_id": null
+  },
+  {
+    "player_id": "6935bcd342796103f7ed41db",
+    "player_slug": "2000157265",
+    "price": 19809787,
+    "name": "Oso",
+    "team_id": null
+  },
+  {
+    "player_id": "68c5f5d55bd165052e271611",
+    "player_slug": "2000149186",
+    "price": 14133287,
+    "name": "Ángel Pérez",
+    "team_id": null
+  },
+  {
+    "player_id": "64a0a08ba58cb1732757ad81",
+    "player_slug": "67245796",
+    "price": 24385166,
+    "name": "Reina",
+    "team_id": null
+  },
+  {
+    "player_id": "5f32e17633a68903ecffbd1f",
+    "player_slug": "67256618",
+    "price": 17622156,
+    "name": "Vivian",
+    "team_id": null
+  },
+  {
+    "player_id": "5995a8857c7bb19d3a5d41cd",
+    "player_slug": "67184889",
+    "price": 10293431,
+    "name": "Nacho Vidal",
+    "team_id": null
+  },
+  {
+    "player_id": "51aa7d11a56ca458020523d8",
+    "player_slug": "67153634",
+    "price": 16175777,
+    "name": "Omar Mascarell",
+    "team_id": null
+  },
+  {
+    "player_id": "63092ba34c71a52ba37b8165",
+    "player_slug": "2000164598",
+    "price": 24245968,
+    "name": "Joel Roca",
+    "team_id": null
+  }
+]
