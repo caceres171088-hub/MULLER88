@@ -152,5 +152,33 @@
     "price": 24245968,
     "name": "Joel Roca",
     "team_id": null
+  },
+  {
+    "player_id": "5d0235d88721525ead8d96db",
+    "player_slug": "19273276",
+    "price": 20877573,
+    "name": "Militao",
+    "team_id": null
+  },
+  {
+    "player_id": "577743d027ae4bd9135ae3d8",
+    "player_slug": "14129337",
+    "price": 14081148,
+    "name": "Nahuel Molina",
+    "team_id": null
+  },
+  {
+    "player_id": "60e72704dfb903607d1f7d87",
+    "player_slug": "77016093",
+    "price": 6651238,
+    "name": "Dituro",
+    "team_id": null
+  },
+  {
+    "player_id": "63113aaa4028c60760685f1e",
+    "player_slug": "24039427",
+    "price": 9105258,
+    "name": "Caleta-Car",
+    "team_id": null
   }
 ]
